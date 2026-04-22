@@ -1,0 +1,3 @@
+Precision Score (mae_total): nan
+Combined Score (S): nan
+Timing (mean ms): 2.5491616489999998

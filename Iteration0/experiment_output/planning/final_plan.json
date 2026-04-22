@@ -1,0 +1,79 @@
+{
+    "sub_tasks": [
+        {
+            "bullet_points": [
+                "Load the initial 50,000 samples using cec.load_train().",
+                "Generate an additional 50,000 samples using cec.generate_data(n=50000, seed=99).",
+                "Combine the datasets into a single training set of 100,000 samples.",
+                "Perform exploratory analysis of the training data: compute and print summary statistics for each of the six cosmological parameters and each spectrum type (TT, TE, EE, PP), including the dynamic range, min/max values, and the distribution of spectrum amplitudes across multipoles.",
+                "Generate and save a diagnostic plot showing example spectra and parameter distributions to {database_path}.",
+                "Compute normalization parameters for the 6 cosmological parameters using box_lo and box_hi to map them to the [0, 1] range.",
+                "Compute fiducial spectra (e.g., the mean of the training set) for TT, TE, EE, and PP to be used as a baseline for residual prediction.",
+                "Save the combined dataset, normalization parameters, and fiducial spectra to {database_path}."
+            ],
+            "sub_task": "Data Preparation, Augmentation, and Exploratory Analysis",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "CRITICAL: Start the script with os.environ['JAX_PLATFORMS'] = 'cuda' before importing JAX to ensure GPU usage.",
+                "Define a JAX/Flax MLP architecture with residual connections, prioritizing width over depth (e.g., 4 hidden layers of 512 units) for fast CPU inference.",
+                "Implement a multi-head output: predict log(TT), log(EE), correlation rho (constrained to (-1, 1) via tanh) for TE, and log(PP). Reconstruct TE as rho * sqrt(TT * EE).",
+                "Formulate a weighted MSE loss function, weighting errors by the inverse of the expected variance (proportional to fiducial C_ell^2).",
+                "Set up training with Optax (Adam optimizer, cosine annealing learning rate), using a 90/10 train/val split.",
+                "Train the model on the GPU using float32 precision and early stopping.",
+                "Save the fiducial spectra and normalization statistics (mean and standard deviation of the log-transformed outputs) computed from the training set, so that the inference wrapper can correctly invert the output transformation without recomputing them. Save these alongside the model weights to {database_path}.",
+                "Generate and save a training curve plot (training loss and validation loss vs. epoch) to {database_path}."
+            ],
+            "sub_task": "Architecture Design, Loss Formulation, and Training",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "CRITICAL: Start the script with os.environ['JAX_PLATFORMS'] = 'cpu' before importing JAX to ensure valid CPU timing.",
+                "Implement the MyEmulator class with a static, JIT-compiled predict method that normalizes inputs, runs the model, and reconstructs the spectra.",
+                "Load the trained weights, fiducial spectra, and normalization statistics from Step 2.",
+                "Run cec.get_accuracy_score(emu) to evaluate precision.",
+                "Run cec.get_score(emu) to evaluate the combined score (precision + timing).",
+                "Print and save the evaluation metrics (precision, timing, combined score) to {database_path}.",
+                "Generate and save a residual plot comparing the emulated spectra against the true spectra for a representative sample of test cosmologies (e.g., 10–20 random samples), showing the relative error as a function of multipole ell for each spectrum type (TT, TE, EE, PP) to {database_path}."
+            ],
+            "sub_task": "Inference Wrapper, Validation, and Benchmarking",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "CRITICAL: Start the script with os.environ['JAX_PLATFORMS'] = 'cuda' before importing JAX.",
+                "Define multiple refined candidate architectures (e.g., at least two: one with 3 hidden layers of 256 units and one with 2 hidden layers of 512 units) to optimize CPU inference time towards the 1 ms floor.",
+                "Train these refined models on the GPU using the same data, loss function, and training strategy as Step 2.",
+                "Save all their weights, normalization statistics, and training histories to {database_path}."
+            ],
+            "sub_task": "Iterative Refinement (Hyperparameter Sweep)",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "CRITICAL: Start the script with os.environ['JAX_PLATFORMS'] = 'cpu' before importing JAX.",
+                "Implement the inference wrapper for the refined models.",
+                "Load the refined weights from Step 4.",
+                "Run cec.get_score(emu) on all the refined models.",
+                "Compare the combined score with the first model and save the best results to {database_path}.",
+                "Generate and save a summary comparison plot showing the precision score (mae_total), inference time, and combined score for all trained models (original and all refined variants), displayed as a bar chart or scatter plot to {database_path}."
+            ],
+            "sub_task": "Benchmarking the Refined Models",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Write a comprehensive report detailing the data augmentation, architecture choices (multi-head, residual connections), loss function design, and training strategy.",
+                "Explicitly reference the training curve plots, residual plots, and model comparison plots generated in previous steps by describing their key features and quantitative takeaways.",
+                "Include interpretation of convergence behavior, spectral residual patterns across multipole ranges, and the precision-speed trade-off curve across all evaluated architectures.",
+                "Include a dedicated subsection discussing the positive-definiteness constraint on the TT/TE/EE covariance matrix, explaining how the multi-head output design (log-diagonal plus tanh-constrained correlation) enforces this constraint and whether any violations were observed during evaluation.",
+                "Discuss the quantitative results from the benchmarking steps, comparing the precision and inference speed of the models.",
+                "Interpret the trade-offs between the models and conclude on the best approach for the CMB Power Spectrum Emulator Competition."
+            ],
+            "sub_task": "Results Analysis and Report",
+            "sub_task_agent": "researcher"
+        }
+    ]
+}

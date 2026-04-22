@@ -1,0 +1,20 @@
+[
+    {
+        "name": "Original (512x4)",
+        "mae_total": NaN,
+        "t_cpu_ms": 2.821706068,
+        "combined_S": NaN
+    },
+    {
+        "name": "Refined 256x3",
+        "mae_total": NaN,
+        "t_cpu_ms": 0.7537835919999999,
+        "combined_S": NaN
+    },
+    {
+        "name": "Refined 512x2",
+        "mae_total": NaN,
+        "t_cpu_ms": 3.081436689,
+        "combined_S": NaN
+    }
+]
