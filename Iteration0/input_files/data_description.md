@@ -1,229 +1,146 @@
+# CMB Power Spectrum Emulator — Data Description
 
-# CMB Power Spectrum Emulator — Dataset Description (v2)
+## Competition Goal
 
-## Overview
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on two criteria: precision at the likelihood level, and CPU inference speed. The combined score is:
 
-Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+```
+S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
 
-## Package and Data Access
+Lower is better. The scoring function is `cmbemu.get_score(emulator)`.
 
-The `cmbemu` package is installed in the Denario venv and must be imported as:
+---
+
+## Package Access
+
 ```python
 import sys
 sys.path.insert(0, '/home/node/work/cmbemu/src/')
 import cmbemu as cec
 ```
 
-Training data (50,000 cosmologies, pre-cached — no download needed):
+---
+
+## Training Data
+
+50,000 cosmologies, pre-cached locally (no download needed):
+
 ```python
 train = cec.load_train()
-# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
 ```
 
-Cached file location (use directly with np.load if needed):
-- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+Or load directly:
+```python
+import numpy as np
+train = np.load(
+    '/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1'
+    '/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz',
+    allow_pickle=False
+)
+```
 
-## Dataset Shapes and Units
+### Shapes and units
 
-- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
-- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
-- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
-- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
-- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
-- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
-- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
-- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `params` | (50000, 6) | Cosmological parameters, float32, physical units |
+| `tt` | (50000, 6001) | C_ℓ^TT, ℓ = 0…6000, units K² |
+| `te` | (50000, 6001) | C_ℓ^TE, ℓ = 0…6000 |
+| `ee` | (50000, 6001) | C_ℓ^EE, ℓ = 0…6000 |
+| `pp` | (50000, 3001) | C_ℓ^φφ, ℓ = 0…3000 |
+| `box_lo` | (6,) | Parameter box lower bounds |
+| `box_hi` | (6,) | Parameter box upper bounds |
+| `param_names` | (6,) | Parameter name strings |
 
-Concrete parameter ranges:
-- omega_b:          [0.020, 0.025]
-- omega_cdm:        [0.090, 0.150]
-- H0:               [55.0,  85.0]
-- tau_reio:         [0.030, 0.100]
-- ln10^{10}A_s:     [2.700, 3.300]
-- n_s:              [0.920, 1.020]
+ℓ = 0 and ℓ = 1 entries are present but ignored by the scorer. Only ℓ ≥ 2 is evaluated.
 
-ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+### Parameter ranges
+
+| Parameter | Low | High |
+|-----------|-----|------|
+| omega_b | 0.020 | 0.025 |
+| omega_cdm | 0.090 | 0.150 |
+| H0 | 55.0 | 85.0 |
+| tau_reio | 0.030 | 0.100 |
+| ln10^{10}A_s | 2.700 | 3.300 |
+| n_s | 0.920 | 1.020 |
+
+---
 
 ## Emulator Interface
+
+Any Python object with a `predict(params: dict) -> dict` method:
 
 ```python
 class MyEmulator:
     def predict(self, params: dict) -> dict:
-        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
-        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
-        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
-        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        # Input: dict with keys matching PARAM_NAMES, float values
+        # Output: dict with keys 'tt', 'te', 'ee', 'pp'
+        #   tt, te, ee: np.ndarray shape (6001,)
+        #   pp:         np.ndarray shape (3001,)
         ...
 ```
 
-## Scoring
-
-```python
-acc = cec.get_accuracy_score(emu)   # precision only, fast
-tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
-full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
-```
-
-Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
-
-## ═══════════════════════════════════════════════
-## MANDATORY: GPU SETUP FOR TRAINING
-## ═══════════════════════════════════════════════
-
-Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
-
-```python
-import os
-os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
-import jax
-# Verify GPU is active:
-assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
-    f"GPU not found, devices = {jax.devices()}"
-print("Training on:", jax.devices())
-```
-
-This snippet has been tested and confirmed to work in this environment:
-- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
-- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
-- Expected output: `Training on: [CudaDevice(id=0)]`
-
-The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
-
-For scoring/timing, JAX must be pinned to CPU (scorer requirement):
-```python
-os.environ['JAX_PLATFORMS'] = 'cpu'
-```
-Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
-
-## ═══════════════════════════════════════════════
-## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
-## ═══════════════════════════════════════════════
-
-The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
-
-### Step 1: Preprocessing (do once, save to disk)
-
-```python
-import numpy as np
-train = cec.load_train()
-
-ell_cmb = np.arange(6001)
-ell_pp  = np.arange(3001)
-factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
-factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
-
-# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
-D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
-D_te = train['te'] * factor_cmb
-D_ee = train['ee'] * factor_cmb
-D_pp = train['pp'] * factor_pp    # shape (N, 3001)
-
-# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
-# For TT, EE, PP: take log. For TE: keep linear or use asinh.
-log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
-log_D_ee = np.log(D_ee[:, 2:])
-log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
-D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
-
-# Concatenate into flat target vector
-targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
-# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
-
-# Normalize inputs: min-max scale to [0, 1]
-box_lo = train['box_lo']  # shape (6,)
-box_hi = train['box_hi']
-X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
-
-# Standardize targets: zero mean, unit variance
-target_mean = targets_raw.mean(axis=0)   # shape (20996,)
-target_std  = targets_raw.std(axis=0)
-target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
-Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
-```
-
-### Step 2: The predict() method — CRITICAL
-
-The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
-
+Parameter names in the input dict (canonical order):
 ```python
 PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
-
-def predict(self, params_dict: dict) -> dict:
-    # 1. Scale input parameters to [0, 1]
-    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
-    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
-
-    # 2. Run neural network → standardized log-Dℓ predictions
-    y_std = self._nn_predict(x_scaled)   # shape (20996,)
-
-    # 3. Undo standardization
-    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
-
-    # 4. Unpack the 4 segments
-    log_D_tt = y_raw[0:5999]
-    D_te_lin = y_raw[5999:11998]
-    log_D_ee = y_raw[11998:17997]
-    log_D_pp = y_raw[17997:20996]
-
-    # 5. Undo log transform
-    D_tt = np.exp(log_D_tt)   # shape (5999,)
-    D_ee = np.exp(log_D_ee)
-    D_pp = np.exp(log_D_pp)   # shape (2999,)
-    D_te = D_te_lin            # already linear
-
-    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
-    ell_cmb = np.arange(2, 6001)
-    ell_pp  = np.arange(2, 3001)
-    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
-    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
-
-    C_tt = D_tt / factor_cmb   # shape (5999,)
-    C_te = D_te / factor_cmb
-    C_ee = D_ee / factor_cmb
-    C_pp = D_pp / factor_pp    # shape (2999,)
-
-    # 7. Pad ℓ=0,1 with zeros to restore full shape
-    pad2 = np.zeros(2, dtype=np.float32)
-    return {
-        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
-        'te': np.concatenate([pad2, C_te]).astype(np.float32),
-        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
-        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
-    }
 ```
 
-ALWAYS verify the predict() method is correct before training by running:
+---
+
+## Scoring API
+
 ```python
-# Sanity check: predict a training point and compare to ground truth
-i = 0
-params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
-pred = emu.predict(params_dict)
-truth_tt = train['tt'][i]  # shape (6001,)
-rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
-print("Max relative TT error on training point:", rel_err_tt.max())
-# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
-# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+# Precision only (~2 s, deterministic — use this during training)
+acc = cec.get_accuracy_score(emu)
+# Returns: {'mae_total': {'mae': ..., ...}, 'mae_cmb': {...}, 'mae_pp': {...}, ...}
+
+# CPU timing only (1000 single-threaded calls)
+tim = cec.get_time_score(emu)
+# Returns: {'t_cpu_ms_mean': ..., 't_cpu_ms_median': ..., 't_cpu_ms_std': ...}
+
+# Combined score (runs both above)
+full = cec.get_score(emu)
+# Returns: {'combined_S': ..., 'mae_total': {...}, 'timing': {...}, ...}
 ```
 
-## Architecture Recommendations
+Baseline reference: `cec.ConstantPlanck()` gives `mae_total ≈ 1.13 × 10⁷`.
 
-- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
-- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
-- Use mini-batches of 1024–4096 (GPU memory allows it)
-- Adam/AdamW with cosine LR schedule; ~200–500 epochs
-- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+**Important:** `cec.get_time_score` and `cec.get_score` require JAX pinned to CPU (scorer uses single-threaded CPU timing). Set `os.environ['JAX_PLATFORMS'] = 'cpu'` at the top of any benchmarking script.
 
-## Additional Data Generation
+### Additional data generation
 
 ```python
-# Generate 50k extra cosmologies (takes ~minutes on this machine)
 extra = cec.generate_data(n=50000, seed=99)
 # Returns same dict format as load_train()
 ```
 
-## Hardware
+---
 
-- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
-- 64 CPU cores, 128 GB RAM
-- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
-- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+## MANDATORY: GPU Setup for Training
+
+Every training script must begin with the following lines **before any other imports**:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'   # must come before import jax
+
+import jax
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found — devices = {jax.devices()}"
+print("Training on:", jax.devices())
+# Expected output: Training on: [CudaDevice(id=0)]
+```
+
+This snippet is tested and confirmed working in this environment:
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 + jax-cuda12-plugin 0.10.0
+
+The env var **must** be set before `import jax`. Setting it after has no effect.
+
+### Hardware
+
+- GPU: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- CPU: 64 cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0, Flax 0.12.6, Optax 0.2.8
