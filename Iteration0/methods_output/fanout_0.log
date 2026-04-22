@@ -10,258 +10,279 @@ Take into account and potential feedback (if any).
 If the plan is already good enough, do not give suggestions to improve it. If this is not first iteration, you will also be provided with the previous research plan along with some feedback on it. If this is the case, take into account the feedback provided when designing the new research plan. It is good to have a detailed plan, but not to have an overly complicated plan. If you dont have suggestions, just say that you dont have further suggestions. The idea should remain the same. No need to add code to the research plan, as another agent will write code given the research plan.
 
 Data description:
+# CMB Power Spectrum Emulator — Data Description
 
-# CMB Power Spectrum Emulator — Dataset Description (v2)
+## Competition Goal
 
-## Overview
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on two criteria: precision at the likelihood level, and CPU inference speed. The combined score is:
 
-Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+```
+S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
 
-## Package and Data Access
+Lower is better. The scoring function is `cmbemu.get_score(emulator)`.
 
-The `cmbemu` package is installed in the Denario venv and must be imported as:
+---
+
+## Package Access
+
 ```python
 import sys
 sys.path.insert(0, '/home/node/work/cmbemu/src/')
 import cmbemu as cec
 ```
 
-Training data (50,000 cosmologies, pre-cached — no download needed):
+---
+
+## Training Data
+
+50,000 cosmologies, pre-cached locally (no download needed):
+
 ```python
 train = cec.load_train()
-# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
 ```
 
-Cached file location (use directly with np.load if needed):
-- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+Or load directly:
+```python
+import numpy as np
+train = np.load(
+    '/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1'
+    '/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz',
+    allow_pickle=False
+)
+```
 
-## Dataset Shapes and Units
+### Shapes and units
 
-- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
-- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
-- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
-- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
-- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
-- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
-- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
-- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `params` | (50000, 6) | Cosmological parameters, float32, physical units |
+| `tt` | (50000, 6001) | C_ℓ^TT, ℓ = 0…6000, units K² |
+| `te` | (50000, 6001) | C_ℓ^TE, ℓ = 0…6000 |
+| `ee` | (50000, 6001) | C_ℓ^EE, ℓ = 0…6000 |
+| `pp` | (50000, 3001) | C_ℓ^φφ, ℓ = 0…3000 |
+| `box_lo` | (6,) | Parameter box lower bounds |
+| `box_hi` | (6,) | Parameter box upper bounds |
+| `param_names` | (6,) | Parameter name strings |
 
-Concrete parameter ranges:
-- omega_b:          [0.020, 0.025]
-- omega_cdm:        [0.090, 0.150]
-- H0:               [55.0,  85.0]
-- tau_reio:         [0.030, 0.100]
-- ln10^{10}A_s:     [2.700, 3.300]
-- n_s:              [0.920, 1.020]
+ℓ = 0 and ℓ = 1 entries are present but ignored by the scorer. Only ℓ ≥ 2 is evaluated.
 
-ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+### Parameter ranges
+
+| Parameter | Low | High |
+|-----------|-----|------|
+| omega_b | 0.020 | 0.025 |
+| omega_cdm | 0.090 | 0.150 |
+| H0 | 55.0 | 85.0 |
+| tau_reio | 0.030 | 0.100 |
+| ln10^{10}A_s | 2.700 | 3.300 |
+| n_s | 0.920 | 1.020 |
+
+---
 
 ## Emulator Interface
+
+Any Python object with a `predict(params: dict) -> dict` method:
 
 ```python
 class MyEmulator:
     def predict(self, params: dict) -> dict:
-        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
-        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
-        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
-        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        # Input: dict with keys matching PARAM_NAMES, float values
+        # Output: dict with keys 'tt', 'te', 'ee', 'pp'
+        #   tt, te, ee: np.ndarray shape (6001,)
+        #   pp:         np.ndarray shape (3001,)
         ...
 ```
 
-## Scoring
-
-```python
-acc = cec.get_accuracy_score(emu)   # precision only, fast
-tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
-full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
-```
-
-Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
-
-## ═══════════════════════════════════════════════
-## MANDATORY: GPU SETUP FOR TRAINING
-## ═══════════════════════════════════════════════
-
-Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
-
-```python
-import os
-os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
-import jax
-# Verify GPU is active:
-assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
-    f"GPU not found, devices = {jax.devices()}"
-print("Training on:", jax.devices())
-```
-
-This snippet has been tested and confirmed to work in this environment:
-- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
-- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
-- Expected output: `Training on: [CudaDevice(id=0)]`
-
-The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
-
-For scoring/timing, JAX must be pinned to CPU (scorer requirement):
-```python
-os.environ['JAX_PLATFORMS'] = 'cpu'
-```
-Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
-
-## ═══════════════════════════════════════════════
-## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
-## ═══════════════════════════════════════════════
-
-The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
-
-### Step 1: Preprocessing (do once, save to disk)
-
-```python
-import numpy as np
-train = cec.load_train()
-
-ell_cmb = np.arange(6001)
-ell_pp  = np.arange(3001)
-factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
-factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
-
-# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
-D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
-D_te = train['te'] * factor_cmb
-D_ee = train['ee'] * factor_cmb
-D_pp = train['pp'] * factor_pp    # shape (N, 3001)
-
-# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
-# For TT, EE, PP: take log. For TE: keep linear or use asinh.
-log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
-log_D_ee = np.log(D_ee[:, 2:])
-log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
-D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
-
-# Concatenate into flat target vector
-targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
-# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
-
-# Normalize inputs: min-max scale to [0, 1]
-box_lo = train['box_lo']  # shape (6,)
-box_hi = train['box_hi']
-X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
-
-# Standardize targets: zero mean, unit variance
-target_mean = targets_raw.mean(axis=0)   # shape (20996,)
-target_std  = targets_raw.std(axis=0)
-target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
-Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
-```
-
-### Step 2: The predict() method — CRITICAL
-
-The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
-
+Parameter names in the input dict (canonical order):
 ```python
 PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
-
-def predict(self, params_dict: dict) -> dict:
-    # 1. Scale input parameters to [0, 1]
-    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
-    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
-
-    # 2. Run neural network → standardized log-Dℓ predictions
-    y_std = self._nn_predict(x_scaled)   # shape (20996,)
-
-    # 3. Undo standardization
-    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
-
-    # 4. Unpack the 4 segments
-    log_D_tt = y_raw[0:5999]
-    D_te_lin = y_raw[5999:11998]
-    log_D_ee = y_raw[11998:17997]
-    log_D_pp = y_raw[17997:20996]
-
-    # 5. Undo log transform
-    D_tt = np.exp(log_D_tt)   # shape (5999,)
-    D_ee = np.exp(log_D_ee)
-    D_pp = np.exp(log_D_pp)   # shape (2999,)
-    D_te = D_te_lin            # already linear
-
-    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
-    ell_cmb = np.arange(2, 6001)
-    ell_pp  = np.arange(2, 3001)
-    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
-    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
-
-    C_tt = D_tt / factor_cmb   # shape (5999,)
-    C_te = D_te / factor_cmb
-    C_ee = D_ee / factor_cmb
-    C_pp = D_pp / factor_pp    # shape (2999,)
-
-    # 7. Pad ℓ=0,1 with zeros to restore full shape
-    pad2 = np.zeros(2, dtype=np.float32)
-    return {
-        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
-        'te': np.concatenate([pad2, C_te]).astype(np.float32),
-        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
-        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
-    }
 ```
 
-ALWAYS verify the predict() method is correct before training by running:
+---
+
+## Scoring API
+
 ```python
-# Sanity check: predict a training point and compare to ground truth
-i = 0
-params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
-pred = emu.predict(params_dict)
-truth_tt = train['tt'][i]  # shape (6001,)
-rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
-print("Max relative TT error on training point:", rel_err_tt.max())
-# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
-# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+# Precision only (~2 s, deterministic — use this during training)
+acc = cec.get_accuracy_score(emu)
+# Returns: {'mae_total': {'mae': ..., ...}, 'mae_cmb': {...}, 'mae_pp': {...}, ...}
+
+# CPU timing only (1000 single-threaded calls)
+tim = cec.get_time_score(emu)
+# Returns: {'t_cpu_ms_mean': ..., 't_cpu_ms_median': ..., 't_cpu_ms_std': ...}
+
+# Combined score (runs both above)
+full = cec.get_score(emu)
+# Returns: {'combined_S': ..., 'mae_total': {...}, 'timing': {...}, ...}
 ```
 
-## Architecture Recommendations
+Baseline reference: `cec.ConstantPlanck()` gives `mae_total ≈ 1.13 × 10⁷`.
 
-- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
-- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
-- Use mini-batches of 1024–4096 (GPU memory allows it)
-- Adam/AdamW with cosine LR schedule; ~200–500 epochs
-- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+**Important:** `cec.get_time_score` and `cec.get_score` require JAX pinned to CPU (scorer uses single-threaded CPU timing). Set `os.environ['JAX_PLATFORMS'] = 'cpu'` at the top of any benchmarking script.
 
-## Additional Data Generation
+### Additional data generation
 
 ```python
-# Generate 50k extra cosmologies (takes ~minutes on this machine)
 extra = cec.generate_data(n=50000, seed=99)
 # Returns same dict format as load_train()
 ```
 
-## Hardware
+---
 
-- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
-- 64 CPU cores, 128 GB RAM
-- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
-- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+## MANDATORY: GPU Setup for Training
+
+Every training script must begin with the following lines **before any other imports**:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'   # must come before import jax
+
+import jax
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found — devices = {jax.devices()}"
+print("Training on:", jax.devices())
+# Expected output: Training on: [CudaDevice(id=0)]
+```
+
+This snippet is tested and confirmed working in this environment:
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 + jax-cuda12-plugin 0.10.0
+
+The env var **must** be set before `import jax`. Setting it after has no effect.
+
+### Hardware
+
+- GPU: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- CPU: 64 cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0, Flax 0.12.6, Optax 0.2.8
 
 
 Idea:
-**Title**: Residual Deep-Stack MLP with Hybrid Huber-Log Spectral Loss
+# CMB Power Spectrum Emulator Competition
 
-**Description**: This architecture employs a high-capacity residual MLP with a 6→512→1024→1024→512→20996 topology, utilizing GELU activations and LayerNorm to capture the high-frequency acoustic oscillations across 6,000 $\ell$-modes. To address the sign-indefinite nature of $C_\ell^{TE}$ while maintaining precision for the strictly positive $C_\ell^{TT, EE, PP}$, the training objective implements a dual-regime loss function: MSE on log-transformed $D_\ell$ for TT, EE, and PP, combined with a Huber loss on linear $D_\ell^{TE}$ to prevent gradient instability at zero-crossings. By increasing the depth to four primary residual blocks, the model maximizes feature extraction capability within the provided Blackwell GPU memory constraints. The final inference pipeline is optimized via JIT-compilation to satisfy CPU latency requirements, mapping inputs directly to the 20,996-dimensional spectral space without bottleneck-induced information loss. This approach ensures likelihood-level accuracy by optimizing the spectral reconstruction as a high-fidelity regression task rather than a dimensionality reduction problem.
+## The Task
+
+The goal is to train a fast, accurate neural-network emulator of the four CMB angular power spectra — **TT**, **TE**, **EE**, and lensing-potential **φφ** — as a function of six ΛCDM cosmological parameters.
+
+The emulator will be used inside MCMC sampling chains, where it must replace the full Boltzmann solver (CLASS/CAMB) at each likelihood evaluation. This places two competing demands on the design:
+
+1. **Precision** — the emulated spectra must reproduce the likelihood function accurately enough that parameter inference is not biased.
+2. **Speed** — inference must be fast enough for MCMC use; the target is sub-millisecond CPU `predict()` calls.
+
+## Inputs and Outputs
+
+### Input
+
+A Python dict with six cosmological parameters:
+
+```python
+{
+    "omega_b":       float,   # Ω_b h²      ∈ [0.020, 0.025]
+    "omega_cdm":     float,   # Ω_cdm h²    ∈ [0.090, 0.150]
+    "H0":            float,   # km/s/Mpc    ∈ [55.0,  85.0]
+    "tau_reio":      float,   #             ∈ [0.030, 0.100]
+    "ln10^{10}A_s":  float,   #             ∈ [2.700, 3.300]
+    "n_s":           float,   #             ∈ [0.920, 1.020]
+}
+```
+
+### Output
+
+A Python dict with four spectra:
+
+```python
+{
+    "tt": np.ndarray (6001,),   # C_ℓ^TT, ℓ = 0…6000
+    "te": np.ndarray (6001,),   # C_ℓ^TE
+    "ee": np.ndarray (6001,),   # C_ℓ^EE
+    "pp": np.ndarray (3001,),   # C_ℓ^φφ, ℓ = 0…3000
+}
+```
+
+ℓ = 0 and ℓ = 1 entries must be present but are ignored by the scorer.
+
+## Scoring
+
+Scoring has two components.
+
+### Precision: MAE on Δχ²
+
+For each pair of test cosmologies (i, j), the scorer computes the Wishart log-likelihood χ²(i,j) using the true spectra as mock data and the emulated spectra as theory. The precision score is the mean absolute error between the emulated and true χ² values, averaged over all N(N−1) = 24,995,000 off-diagonal pairs from the 5,000-point test set:
+
+```
+S_prec = mean_{i≠j} |χ²_emu(i,j) − χ²_true(i,j)|
+```
+
+TT/TE/EE are evaluated jointly via a 2×2 Wishart covariance (`mae_cmb`). φφ is evaluated separately as a scalar Wishart (`mae_pp`). The primary score is `mae_total = mae_cmb + mae_pp`.
+
+### Speed: Mean CPU inference time
+
+The timing score is the mean wall time per `predict()` call, measured over 1,000 single-threaded CPU calls with fresh inputs each time (to prevent caching). The soft floor is 1 ms — sub-millisecond speed provides no further benefit.
+
+### Combined score
+
+```
+S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Lower is better. One decade of precision improvement trades equally against one decade of speed improvement (above the 1 ms floor).
+
+### Baseline
+
+`cec.ConstantPlanck()` always returns the Planck fiducial spectrum regardless of input. It achieves `mae_total ≈ 1.13 × 10⁷` (enormous precision error) and near-zero inference time (hits the floor). A real emulator must beat this by many orders of magnitude on precision.
+
+## Interface Requirement
+
+Any object with a `predict(params: dict) -> dict` method. No base class or registration required. Example:
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict[str, np.ndarray]:
+        ...
+        return {"tt": tt, "te": te, "ee": ee, "pp": pp}
+```
+
+## Key Design Constraints
+
+- **Positive definiteness**: At each ℓ, the 2×2 matrix [[C_ℓ^TT, C_ℓ^TE], [C_ℓ^TE, C_ℓ^EE]] must be positive definite (i.e., |C_ℓ^TE|² < C_ℓ^TT · C_ℓ^EE). Violations cause the Wishart likelihood to be undefined.
+- **CPU timing**: The `predict()` call is timed on a single CPU thread. GPU inference is not valid for the speed benchmark. The model must be JIT-compiled for fast CPU execution.
+- **No test set leakage**: The 5,000-point test set is held out for final scoring only. Do not use it for training or hyperparameter selection.
+
+## Scoring API
+
+```python
+import cmbemu as cec
+
+emu = MyEmulator(...)
+
+# Use during training (fast, deterministic):
+acc = cec.get_accuracy_score(emu)
+print(acc['mae_total']['mae'])   # target: << 10^6
+
+# Use after training is complete, with JAX pinned to CPU:
+# os.environ['JAX_PLATFORMS'] = 'cpu'  (set before import jax)
+full = cec.get_score(emu)
+print(full['combined_S'])
+```
+
 
 Research plan:
-1. **Data Preparation and Augmentation**: Load the initial 50,000 cosmologies using `cec.load_train()`. Generate an additional 50,000 samples using `cec.generate_data(n=50000, seed=99)` to increase training diversity. Combine these datasets and perform a 90/10 split for training and validation.
+1. **Data Preprocessing and Normalization**: Load the training dataset and apply min-max scaling to the cosmological parameters based on the provided `box_lo` and `box_hi` bounds to map them to the [0, 1] range. For the target spectra, apply a logarithmic transformation (e.g., $log(C_\ell + \epsilon)$) or standard scaling to stabilize training, ensuring that the transformation is reversible for the `predict` method.
 
-2. **Preprocessing Pipeline**: Implement the transformation logic: convert $C_\ell$ to $D_\ell$ for $\ell \ge 2$, apply a natural logarithm to $D_\ell^{TT, EE, PP}$, and keep $D_\ell^{TE}$ in linear space. Normalize input parameters to $[0, 1]$ using the provided box bounds and standardize the concatenated target vector (20,996 dimensions) to zero mean and unit variance. Store the scaling factors and means for use in the `predict()` method.
+2. **Architecture Design**: Implement a multi-output neural network using JAX/Flax. To ensure the positive definiteness of the 2x2 covariance matrix for (TT, TE, EE), parameterize the output as a Cholesky decomposition: $L = [[L_{11}, 0], [L_{21}, L_{22}]]$, where $C = LL^T$. This guarantees $C_\ell^{TT} = L_{11}^2$, $C_\ell^{TE} = L_{11}L_{21}$, and $C_\ell^{EE} = L_{21}^2 + L_{22}^2$. Use a deep MLP with residual connections and Swish activation functions to capture the non-linear dependencies between parameters and spectra.
 
-3. **Neural Network Architecture**: Construct a residual MLP with a 6→512→1024→1024→512→20996 topology. Incorporate LayerNorm after each linear layer and use GELU activations. Implement residual connections between the hidden layers to facilitate gradient flow. Ensure the model is initialized for JAX on the GPU using the mandatory environment configuration.
+3. **Loss Function Formulation**: Define a custom loss function that minimizes the Mean Squared Error (MSE) between the predicted and true spectra. Incorporate a weighted loss strategy where the weights are adjusted based on the sensitivity of the likelihood to specific $\ell$-ranges, ensuring higher precision in the acoustic peak regions.
 
-4. **Hybrid Loss Function Implementation**: Define a custom loss function that computes the Mean Squared Error (MSE) for the log-transformed $D_\ell^{TT, EE, PP}$ components and a Huber loss for the linear $D_\ell^{TE}$ component. This hybrid approach balances the high-dynamic-range requirements of the positive spectra with the stability needed for the sign-changing TE spectrum.
+4. **Training Strategy**: Utilize the Adam optimizer with a cosine annealing learning rate schedule. Train the model on the GPU using the provided 50,000 samples, employing a batch size that maximizes VRAM utilization. Implement early stopping based on a validation split (10% of the training data) to prevent overfitting.
 
-5. **Training Protocol**: Train the model using the AdamW optimizer with a cosine learning rate schedule. Utilize a batch size of 8,192 to leverage the Blackwell GPU's memory. Train for 500 epochs, monitoring the validation loss and the `cec.get_accuracy_score` every 50 epochs to prevent overfitting and ensure the model meets likelihood-level precision.
+5. **JIT Compilation and CPU Optimization**: Since the final inference must be fast on a single CPU thread, use `jax.jit` to compile the `predict` function. Ensure that the model architecture is lightweight (e.g., limiting the number of layers and hidden units) to keep the inference time below the 1 ms threshold. Avoid heavy operations within the `predict` method that cannot be efficiently JIT-compiled.
 
-6. **Inference Pipeline Optimization**: Implement the `MyEmulator` class, ensuring the `predict()` method strictly follows the inverse transformation steps: scaling input parameters, running the JIT-compiled forward pass, reversing standardization, applying the inverse log/linear transforms, and re-padding the $\ell=0, 1$ indices with zeros.
+6. **Inference Wrapper Implementation**: Create the `MyEmulator` class with a `predict` method that accepts a dictionary of parameters. Inside this method, perform the inverse of the normalization applied in Step 1, pass the parameters through the JIT-compiled model, and reconstruct the spectra dictionaries, ensuring the output shapes match the requirements (6001 for TT/TE/EE, 3001 for PP).
 
-7. **Validation and Sanity Checking**: Perform a rigorous verification of the `predict()` method by comparing the emulator output against the ground truth for a subset of the training data. Calculate the relative error for each spectrum type to ensure the inverse transformations are mathematically exact and that the model is not defaulting to baseline values.
+7. **Validation and Benchmarking**: Use `cec.get_accuracy_score(emu)` during the development phase to monitor the `mae_total`. Once the precision targets are met, set `os.environ['JAX_PLATFORMS'] = 'cpu'` and run `cec.get_score(emu)` to evaluate the combined score, ensuring the CPU inference time is optimized and the precision remains stable.
 
-8. **Performance Benchmarking**: Once the accuracy threshold is met, pin JAX to the CPU using `os.environ['JAX_PLATFORMS'] = 'cpu'` and execute `cec.get_score(emulator)` to evaluate the combined precision and CPU inference speed. Ensure the final model satisfies the requirement of `mae_total << 10^6`.
+8. **Iterative Refinement**: If the combined score is not optimal, perform a hyperparameter sweep over the network depth, width, and learning rate. If the inference time exceeds 1 ms, prune the network or simplify the architecture while monitoring the impact on the `mae_total` to maintain the required precision.
 
 Previous research plan:
 None
@@ -281,18 +302,16 @@ In <SUGGESTIONS> put the suggestions to improve the plan.
 ###### PROMPT ENDS ########
 
 \begin{SUGGESTIONS}
-The research plan is well-structured and technically sound. I have a few suggestions to further improve the robustness and efficiency of the implementation:
+1. **Refine the Output Representation**: While the Cholesky decomposition is mathematically sound for positive definiteness, it can be numerically unstable if the diagonal elements approach zero. Consider predicting the log-transformed diagonal elements ($log(C_\ell^{TT})$ and $log(C_\ell^{EE})$) and the correlation coefficient $\rho = C_\ell^{TE} / \sqrt{C_\ell^{TT} C_\ell^{EE}}$ (constrained to $[-1, 1]$ via `tanh`). This often leads to better-behaved gradients than raw Cholesky factors.
 
-1. **Weighting the Loss Components**: Since the target vector is a concatenation of different physical spectra with varying magnitudes and units, the raw MSE/Huber loss might be dominated by the components with larger absolute values. Consider adding a scalar weight to each of the four spectral segments (TT, TE, EE, PP) in the loss function to ensure the model learns all spectra with balanced precision.
+2. **Address Spectral Dynamic Range**: The CMB power spectra span several orders of magnitude across $\ell$. Instead of a simple log transform, consider normalizing the spectra by a "fiducial" spectrum (e.g., the Planck best-fit) before training. This allows the network to learn the *residuals* or *deviations* from a known baseline, which is significantly easier than learning the absolute values from scratch.
 
-2. **Input Feature Engineering**: While the MLP is powerful, cosmological parameters often have non-linear relationships with the power spectra. Consider augmenting the input vector with simple physical combinations (e.g., $\omega_b + \omega_{cdm}$) or using a small number of periodic features (sin/cos) for parameters like $n_s$ or $H_0$ to help the MLP capture oscillatory behavior more effectively.
+3. **Inference Optimization (JAX Specifics)**: To ensure the 1ms CPU inference target is met, explicitly mention the use of `jax.jit` with `static_argnums` or `abstract_arrays` if necessary, and ensure the model weights are stored as `float32` (or `float16` if precision allows) to minimize memory bandwidth during inference. Avoid any dynamic control flow inside the `predict` method.
 
-3. **Validation Strategy**: Instead of a simple 90/10 split, consider using a small "hold-out" set of 1,000 samples that are never used for training or hyperparameter tuning. Use this set specifically for the final `cec.get_accuracy_score` evaluation to ensure the reported precision is not biased by the validation data used during training.
+4. **Loss Function Weighting**: The current plan mentions weighting by sensitivity. Since the goal is to minimize the Wishart likelihood error, consider using a loss function that directly approximates the Wishart log-likelihood or a weighted MSE where weights are inversely proportional to the cosmic variance at each $\ell$. This naturally prioritizes the acoustic peaks where the signal-to-noise ratio is highest.
 
-4. **JIT Compilation Strategy**: Ensure that the `predict` method is decorated with `@jax.jit`. Since the inference speed is a critical component of the final score, pre-compiling the forward pass is essential. Additionally, ensure that the `predict` method does not perform any unnecessary memory allocations (like creating new arrays for padding) inside the JIT-compiled function if possible, or ensure they are static.
+5. **Data Augmentation**: With 50,000 samples, you have a good base, but the parameter space is 6D. Consider using the `cec.generate_data` function to create an additional validation set or to perform "active learning" if the model shows high error in specific regions of the parameter space (e.g., near the boundaries of $H_0$ or $\tau_{reio}$).
 
-5. **Early Stopping**: While 500 epochs is a reasonable target, implement an early stopping mechanism based on the `cec.get_accuracy_score` on the validation set. This prevents wasting compute time if the model converges earlier or begins to overfit.
-
-6. **TE Spectrum Handling**: You mentioned using Huber loss for $D_\ell^{TE}$. Since $D_\ell^{TE}$ can be negative, ensure that the standardization (Step 2) is applied correctly to the linear values. If the distribution of $D_\ell^{TE}$ is highly skewed, consider using an `asinh` transform instead of keeping it strictly linear, as this provides a smoother transition around zero and better handles the dynamic range than raw linear values.
+6. **Inference Bottleneck**: Ensure that the `predict` method does not perform unnecessary dictionary conversions or array re-allocations. Pre-allocate the output arrays or use JAX's `jax.lax.scan` if you decide to implement the emulator as a series of smaller, specialized sub-networks for different $\ell$-ranges.
 \end{SUGGESTIONS}
 
