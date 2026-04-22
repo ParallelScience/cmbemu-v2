@@ -1,0 +1,20 @@
+# Data files (large, binary, or generated — do not commit)
+*.csv
+*.npz
+*.npy
+*.pkl
+*.h5
+*.hdf5
+*.parquet
+*.feather
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# parallelArXiv working directory
+**/parallel_arxiv_output/
