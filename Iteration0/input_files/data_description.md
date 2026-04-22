@@ -107,6 +107,10 @@ full = cec.get_score(emu)
 
 Baseline reference: `cec.ConstantPlanck()` gives `mae_total ≈ 1.13 × 10⁷`.
 
+**`mae_total` is the primary validation metric.** Do not use MSE loss on spectra as a proxy — it does not correlate reliably with the Wishart likelihood score. Instead, call `cec.get_accuracy_score(emu)` every N epochs (e.g. every 10–20 epochs) and use `acc['mae_total']['mae']` to monitor and guide training. A well-trained emulator should reach `mae_total << 10⁶` (orders of magnitude below the ConstantPlanck baseline of 1.13×10⁷). Target: `mae_total < 10⁴`.
+
+**`get_accuracy_score` uses the held-out 5,000-point test set.** To avoid test set leakage during hyperparameter tuning, reserve a separate validation split (e.g. 5,000 cosmologies) from the training data for intermediate monitoring. Only call `get_accuracy_score` at the end of each training run or sparingly during training.
+
 **Important:** `cec.get_time_score` and `cec.get_score` require JAX pinned to CPU (scorer uses single-threaded CPU timing). Set `os.environ['JAX_PLATFORMS'] = 'cpu'` at the top of any benchmarking script.
 
 ### Additional data generation
@@ -139,7 +143,32 @@ This snippet is tested and confirmed working in this environment:
 
 The env var **must** be set before `import jax`. Setting it after has no effect.
 
-### Hardware
+### MANDATORY: float64 in predict()
+
+The CMB spectra span 13 orders of magnitude (C_ℓ^TT ~ 10⁻¹⁰ at the first acoustic peak, dropping to ~10⁻²¹ at ℓ=6000; C_ℓ^EE drops to ~10⁻²³). The Wishart likelihood evaluates the log-determinant of the 2×2 covariance matrix, which involves products like C_ℓ^TT × C_ℓ^EE ~ 10⁻⁴⁴. This is below the float32 minimum normal (~1.18×10⁻³⁸), causing underflow to zero and log(0) = −∞ → NaN in the scorer.
+
+**The predict() method MUST cast all spectral outputs to float64 before returning.** The neural network forward pass can use float32 (for speed), but the final exponentiation and output arrays must be float64:
+
+```python
+def predict(self, params_dict):
+    # ... float32 NN forward pass ...
+    log_tt_f64 = log_tt.astype(np.float64)
+    log_ee_f64 = log_ee.astype(np.float64)
+    log_pp_f64 = log_pp.astype(np.float64)
+    C_tt = np.exp(np.clip(log_tt_f64, -700, 700))  # float64
+    C_ee = np.exp(np.clip(log_ee_f64, -700, 700))  # float64
+    C_pp = np.exp(np.clip(log_pp_f64, -700, 700))  # float64
+    rho  = np.tanh(rho_output.astype(np.float64))  # float64
+    C_te = rho * np.sqrt(C_tt * C_ee)              # float64
+    # Return float64 arrays — the scorer requires this
+    return {'tt': C_tt, 'te': C_te, 'ee': C_ee, 'pp': C_pp}
+```
+
+Returning float32 arrays will produce NaN in `get_accuracy_score` for all models. This has been verified empirically.
+
+---
+
+## Hardware
 
 - GPU: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
 - CPU: 64 cores, 128 GB RAM
