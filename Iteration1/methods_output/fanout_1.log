@@ -1,0 +1,375 @@
+
+###### PROMPT BEGINS ########
+Human: You are provided with:
+- a description of the data
+- an idea
+- research plan to carry out the idea.
+
+Your task is to provide suggestions on how to improve the plan.
+Take into account and potential feedback (if any).
+If the plan is already good enough, do not give suggestions to improve it. If this is not first iteration, you will also be provided with the previous research plan along with some feedback on it. If this is the case, take into account the feedback provided when designing the new research plan. It is good to have a detailed plan, but not to have an overly complicated plan. If you dont have suggestions, just say that you dont have further suggestions. The idea should remain the same. No need to add code to the research plan, as another agent will write code given the research plan.
+
+Data description:
+# CMB Power Spectrum Emulator — Data Description
+
+## Competition Goal
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on two criteria: precision at the likelihood level, and CPU inference speed. The combined score is:
+
+```
+S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Lower is better. The scoring function is `cmbemu.get_score(emulator)`.
+
+---
+
+## Package Access
+
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+---
+
+## Training Data
+
+50,000 cosmologies, pre-cached locally (no download needed):
+
+```python
+train = cec.load_train()
+```
+
+Or load directly:
+```python
+import numpy as np
+train = np.load(
+    '/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1'
+    '/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz',
+    allow_pickle=False
+)
+```
+
+### Shapes and units
+
+| Key | Shape | Description |
+|-----|-------|-------------|
+| `params` | (50000, 6) | Cosmological parameters, float32, physical units |
+| `tt` | (50000, 6001) | C_ℓ^TT, ℓ = 0…6000, units K² |
+| `te` | (50000, 6001) | C_ℓ^TE, ℓ = 0…6000 |
+| `ee` | (50000, 6001) | C_ℓ^EE, ℓ = 0…6000 |
+| `pp` | (50000, 3001) | C_ℓ^φφ, ℓ = 0…3000 |
+| `box_lo` | (6,) | Parameter box lower bounds |
+| `box_hi` | (6,) | Parameter box upper bounds |
+| `param_names` | (6,) | Parameter name strings |
+
+ℓ = 0 and ℓ = 1 entries are present but ignored by the scorer. Only ℓ ≥ 2 is evaluated.
+
+### Parameter ranges
+
+| Parameter | Low | High |
+|-----------|-----|------|
+| omega_b | 0.020 | 0.025 |
+| omega_cdm | 0.090 | 0.150 |
+| H0 | 55.0 | 85.0 |
+| tau_reio | 0.030 | 0.100 |
+| ln10^{10}A_s | 2.700 | 3.300 |
+| n_s | 0.920 | 1.020 |
+
+---
+
+## Emulator Interface
+
+Any Python object with a `predict(params: dict) -> dict` method:
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # Input: dict with keys matching PARAM_NAMES, float values
+        # Output: dict with keys 'tt', 'te', 'ee', 'pp'
+        #   tt, te, ee: np.ndarray shape (6001,)
+        #   pp:         np.ndarray shape (3001,)
+        ...
+```
+
+Parameter names in the input dict (canonical order):
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+```
+
+---
+
+## Scoring API
+
+```python
+# Precision only (~2 s, deterministic — use this during training)
+acc = cec.get_accuracy_score(emu)
+# Returns: {'mae_total': {'mae': ..., ...}, 'mae_cmb': {...}, 'mae_pp': {...}, ...}
+
+# CPU timing only (1000 single-threaded calls)
+tim = cec.get_time_score(emu)
+# Returns: {'t_cpu_ms_mean': ..., 't_cpu_ms_median': ..., 't_cpu_ms_std': ...}
+
+# Combined score (runs both above)
+full = cec.get_score(emu)
+# Returns: {'combined_S': ..., 'mae_total': {...}, 'timing': {...}, ...}
+```
+
+Baseline reference: `cec.ConstantPlanck()` gives `mae_total ≈ 1.13 × 10⁷`.
+
+**`mae_total` is the primary validation metric.** Do not use MSE loss on spectra as a proxy — it does not correlate reliably with the Wishart likelihood score. Instead, call `cec.get_accuracy_score(emu)` every N epochs (e.g. every 10–20 epochs) and use `acc['mae_total']['mae']` to monitor and guide training. A well-trained emulator should reach `mae_total << 10⁶` (orders of magnitude below the ConstantPlanck baseline of 1.13×10⁷). Target: `mae_total < 10⁴`.
+
+**`get_accuracy_score` uses the held-out 5,000-point test set.** To avoid test set leakage during hyperparameter tuning, reserve a separate validation split (e.g. 5,000 cosmologies) from the training data for intermediate monitoring. Only call `get_accuracy_score` at the end of each training run or sparingly during training.
+
+**Important:** `cec.get_time_score` and `cec.get_score` require JAX pinned to CPU (scorer uses single-threaded CPU timing). Set `os.environ['JAX_PLATFORMS'] = 'cpu'` at the top of any benchmarking script.
+
+### Additional data generation
+
+```python
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+---
+
+## MANDATORY: GPU Setup for Training
+
+Every training script must begin with the following lines **before any other imports**:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'   # must come before import jax
+
+import jax
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found — devices = {jax.devices()}"
+print("Training on:", jax.devices())
+# Expected output: Training on: [CudaDevice(id=0)]
+```
+
+This snippet is tested and confirmed working in this environment:
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 + jax-cuda12-plugin 0.10.0
+
+The env var **must** be set before `import jax`. Setting it after has no effect.
+
+### MANDATORY: float64 in predict()
+
+The CMB spectra span 13 orders of magnitude (C_ℓ^TT ~ 10⁻¹⁰ at the first acoustic peak, dropping to ~10⁻²¹ at ℓ=6000; C_ℓ^EE drops to ~10⁻²³). The Wishart likelihood evaluates the log-determinant of the 2×2 covariance matrix, which involves products like C_ℓ^TT × C_ℓ^EE ~ 10⁻⁴⁴. This is below the float32 minimum normal (~1.18×10⁻³⁸), causing underflow to zero and log(0) = −∞ → NaN in the scorer.
+
+**The predict() method MUST cast all spectral outputs to float64 before returning.** The neural network forward pass can use float32 (for speed), but the final exponentiation and output arrays must be float64:
+
+```python
+def predict(self, params_dict):
+    # ... float32 NN forward pass ...
+    log_tt_f64 = log_tt.astype(np.float64)
+    log_ee_f64 = log_ee.astype(np.float64)
+    log_pp_f64 = log_pp.astype(np.float64)
+    C_tt = np.exp(np.clip(log_tt_f64, -700, 700))  # float64
+    C_ee = np.exp(np.clip(log_ee_f64, -700, 700))  # float64
+    C_pp = np.exp(np.clip(log_pp_f64, -700, 700))  # float64
+    rho  = np.tanh(rho_output.astype(np.float64))  # float64
+    C_te = rho * np.sqrt(C_tt * C_ee)              # float64
+    # Return float64 arrays — the scorer requires this
+    return {'tt': C_tt, 'te': C_te, 'ee': C_ee, 'pp': C_pp}
+```
+
+Returning float32 arrays will produce NaN in `get_accuracy_score` for all models. This has been verified empirically.
+
+---
+
+## Hardware
+
+- GPU: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- CPU: 64 cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0, Flax 0.12.6, Optax 0.2.8
+
+
+Idea:
+# CMB Power Spectrum Emulator Competition
+
+## The Task
+
+The goal is to train a fast, accurate neural-network emulator of the four CMB angular power spectra — **TT**, **TE**, **EE**, and lensing-potential **φφ** — as a function of six ΛCDM cosmological parameters.
+
+The emulator will be used inside MCMC sampling chains, where it must replace the full Boltzmann solver (CLASS/CAMB) at each likelihood evaluation. This places two competing demands on the design:
+
+1. **Precision** — the emulated spectra must reproduce the likelihood function accurately enough that parameter inference is not biased.
+2. **Speed** — inference must be fast enough for MCMC use; the target is sub-millisecond CPU `predict()` calls.
+
+## Inputs and Outputs
+
+### Input
+
+A Python dict with six cosmological parameters:
+
+```python
+{
+    "omega_b":       float,   # Ω_b h²      ∈ [0.020, 0.025]
+    "omega_cdm":     float,   # Ω_cdm h²    ∈ [0.090, 0.150]
+    "H0":            float,   # km/s/Mpc    ∈ [55.0,  85.0]
+    "tau_reio":      float,   #             ∈ [0.030, 0.100]
+    "ln10^{10}A_s":  float,   #             ∈ [2.700, 3.300]
+    "n_s":           float,   #             ∈ [0.920, 1.020]
+}
+```
+
+### Output
+
+A Python dict with four spectra:
+
+```python
+{
+    "tt": np.ndarray (6001,),   # C_ℓ^TT, ℓ = 0…6000
+    "te": np.ndarray (6001,),   # C_ℓ^TE
+    "ee": np.ndarray (6001,),   # C_ℓ^EE
+    "pp": np.ndarray (3001,),   # C_ℓ^φφ, ℓ = 0…3000
+}
+```
+
+ℓ = 0 and ℓ = 1 entries must be present but are ignored by the scorer.
+
+## Scoring
+
+Scoring has two components.
+
+### Precision: MAE on Δχ²
+
+For each pair of test cosmologies (i, j), the scorer computes the Wishart log-likelihood χ²(i,j) using the true spectra as mock data and the emulated spectra as theory. The precision score is the mean absolute error between the emulated and true χ² values, averaged over all N(N−1) = 24,995,000 off-diagonal pairs from the 5,000-point test set:
+
+```
+S_prec = mean_{i≠j} |χ²_emu(i,j) − χ²_true(i,j)|
+```
+
+TT/TE/EE are evaluated jointly via a 2×2 Wishart covariance (`mae_cmb`). φφ is evaluated separately as a scalar Wishart (`mae_pp`). The primary score is `mae_total = mae_cmb + mae_pp`.
+
+### Speed: Mean CPU inference time
+
+The timing score is the mean wall time per `predict()` call, measured over 1,000 single-threaded CPU calls with fresh inputs each time (to prevent caching). The soft floor is 1 ms — sub-millisecond speed provides no further benefit.
+
+### Combined score
+
+```
+S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Lower is better. One decade of precision improvement trades equally against one decade of speed improvement (above the 1 ms floor).
+
+### Baseline
+
+`cec.ConstantPlanck()` always returns the Planck fiducial spectrum regardless of input. It achieves `mae_total ≈ 1.13 × 10⁷` (enormous precision error) and near-zero inference time (hits the floor). A real emulator must beat this by many orders of magnitude on precision.
+
+## Interface Requirement
+
+Any object with a `predict(params: dict) -> dict` method. No base class or registration required. Example:
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict[str, np.ndarray]:
+        ...
+        return {"tt": tt, "te": te, "ee": ee, "pp": pp}
+```
+
+## Key Design Constraints
+
+- **Positive definiteness**: At each ℓ, the 2×2 matrix [[C_ℓ^TT, C_ℓ^TE], [C_ℓ^TE, C_ℓ^EE]] must be positive definite (i.e., |C_ℓ^TE|² < C_ℓ^TT · C_ℓ^EE). Violations cause the Wishart likelihood to be undefined.
+- **CPU timing**: The `predict()` call is timed on a single CPU thread. GPU inference is not valid for the speed benchmark. The model must be JIT-compiled for fast CPU execution.
+- **No test set leakage**: The 5,000-point test set is held out for final scoring only. Do not use it for training or hyperparameter selection.
+
+## Scoring API
+
+```python
+import cmbemu as cec
+
+emu = MyEmulator(...)
+
+# Use during training (fast, deterministic):
+acc = cec.get_accuracy_score(emu)
+print(acc['mae_total']['mae'])   # target: << 10^6
+
+# Use after training is complete, with JAX pinned to CPU:
+# os.environ['JAX_PLATFORMS'] = 'cpu'  (set before import jax)
+full = cec.get_score(emu)
+print(full['combined_S'])
+```
+
+
+Research plan:
+1. **Data Preparation and Normalization**: Load the initial 50,000 samples and generate an additional 50,000 samples using a Sobol sequence to ensure optimal coverage of the 6D parameter space boundaries. Normalize the cosmological parameters to the [0, 1] range using the provided `box_lo` and `box_hi`. Reserve a strictly independent 5,000-point validation set from the total pool to monitor training progress, ensuring no overlap with the competition's held-out test set.
+
+2. **Target Transformation**: Transform the raw spectra into log-space to handle the 13 orders of magnitude dynamic range. Specifically, compute $\log(C_\ell^{TT})$, $\log(C_\ell^{EE})$, $\log(C_\ell^{PP})$, and the correlation coefficient $\rho_\ell = C_\ell^{TE} / \sqrt{C_\ell^{TT} C_\ell^{EE}}$. This transformation ensures that the network learns the spectral shapes in a stable, linear regime and simplifies the enforcement of the positive-definiteness constraint.
+
+3. **Architecture Implementation**: Utilize a 256x3 MLP architecture (three hidden layers, each with 256 neurons) with ReLU activation functions. This architecture is chosen for its proven balance between representational capacity and sub-millisecond CPU inference speed. Ensure the output layer maps to the transformed targets: two log-spectra, one log-lensing potential, and the correlation coefficient $\rho_\ell$.
+
+4. **Loss Function Formulation**: Implement a standard Mean Squared Error (MSE) loss function applied directly to the log-transformed spectra and the $\rho_\ell$ parameter. By minimizing the MSE in log-space, the model naturally prioritizes relative accuracy across all $\ell$ scales, avoiding the numerical instability and over-penalization issues associated with inverse-variance weighting.
+
+5. **Training Protocol**: Train the model on the GPU using the Adam optimizer with a cosine annealing learning rate schedule. Monitor the `mae_total` using `cec.get_accuracy_score(emu)` on the held-out validation set every 20 epochs. Use early stopping based on this validation score to prevent overfitting and ensure the model generalizes well to the unseen test set.
+
+6. **Numerical Stability and `float64` Casting**: Implement the `predict()` method to perform the neural network forward pass in `float32` for speed, but explicitly cast all final outputs to `float64`. Reconstruct the spectra using `exp()` on the log-outputs and compute $C_\ell^{TE} = \rho_\ell \sqrt{C_\ell^{TT} C_\ell^{EE}}$ using `float64` arithmetic. Apply `np.clip` to the log-spectra before exponentiation to prevent overflow/underflow, ensuring the output is strictly compatible with the Wishart likelihood scorer.
+
+7. **JIT Compilation and Inference Optimization**: Use `jax.jit` to compile the `predict()` method. Ensure the function is static, avoiding dynamic shapes or Python-side control flow. Pre-allocate the output arrays within the `predict` method to minimize memory overhead during the 1,000-call timing benchmark. Set `os.environ['JAX_PLATFORMS'] = 'cpu'` before importing JAX to ensure the timing benchmark reflects single-threaded CPU performance.
+
+8. **Final Benchmarking**: Once the validation `mae_total` reaches the target threshold, perform the final evaluation using `cec.get_score(emu)`. Verify that the combined score $S$ is minimized by confirming that the precision is sufficiently high while maintaining an inference time below the 1 ms threshold.
+
+Previous research plan:
+1. **Data Preparation and Augmentation**: Load the initial 50,000 samples and generate an additional 50,000 samples using `cec.generate_data` to improve coverage of the 6D parameter space. Normalize cosmological parameters to the [0, 1] range using `box_lo` and `box_hi`. To handle the large dynamic range of the CMB spectra, compute a fiducial spectrum (e.g., the mean of the training set) and train the model to predict the residuals (log-ratio or relative difference) between the true spectra and this fiducial baseline.
+
+2. **Architecture Design**: Implement a JAX/Flax MLP with residual connections, prioritizing "width" over "depth" to minimize sequential latency for CPU inference. For the (TT, TE, EE) output, use a multi-head approach: predict the log-transformed diagonal elements ($\log(C_\ell^{TT})$ and $\log(C_\ell^{EE})$) and a correlation coefficient $\rho_\ell$ constrained to $(-1, 1)$ via `tanh` to reconstruct the off-diagonal $C_\ell^{TE} = \rho_\ell \sqrt{C_\ell^{TT} C_\ell^{EE}}$. This ensures positive definiteness and numerical stability.
+
+3. **Loss Function Formulation**: Implement a weighted MSE loss function that mimics the Wishart likelihood structure. Weight the errors at each $\ell$ by the inverse of the expected variance (proportional to $C_\ell^2$), which naturally prioritizes the acoustic peaks where the likelihood is most sensitive. Ensure the loss function is differentiable and compatible with JAX's `grad` and `jit`.
+
+4. **Training Strategy**: Use the Adam optimizer with a cosine annealing learning rate schedule. Train on the GPU using `float32` precision to balance training speed and numerical stability. Employ a 10% validation split to monitor performance and implement early stopping to prevent overfitting.
+
+5. **JIT Compilation and Inference Optimization**: Define the `predict` method to be strictly static, avoiding dynamic shapes, Python-side overhead, or conditional control flow. Use `jax.jit` to compile the model. Ensure all weights are stored as `float32` to avoid type-promotion overhead during inference. Pre-allocate output arrays to avoid memory re-allocation during the 1,000-call timing benchmark.
+
+6. **Inference Wrapper Implementation**: Create the `MyEmulator` class. The `predict` method will: (a) accept the parameter dictionary, (b) apply the normalization, (c) pass inputs through the JIT-compiled model, (d) apply the inverse transformation (re-adding the fiducial baseline), and (e) return the spectra as a dictionary of `numpy` arrays.
+
+7. **Validation and Benchmarking**: During development, use `cec.get_accuracy_score(emu)` to track `mae_total`. Once precision targets are met, set `os.environ['JAX_PLATFORMS'] = 'cpu'` and execute `cec.get_score(emu)` to evaluate the combined score. Ensure the inference time is below the 1 ms threshold.
+
+8. **Iterative Refinement**: If the combined score is suboptimal, perform a hyperparameter sweep focusing on network width and learning rate. If inference time exceeds 1 ms, prune the network or simplify the architecture. If precision is insufficient, increase the training data size or refine the loss function weighting to better match the Wishart likelihood sensitivity.
+
+Feedback on previous research plan:
+The current analysis has successfully addressed the speed requirement and the structural constraints of the CMB spectra, but it has failed to produce a valid precision score due to a predictable numerical instability. The following feedback is provided to guide the next iteration:
+
+**1. Address the `float64` Requirement Immediately:**
+The report correctly identifies the `float32` underflow as the cause of `NaN` results. However, the proposed "Mixed Precision" strategy is not optional—it is a hard requirement for the `predict()` method. You must implement the `predict()` method to perform the final exponentiation and covariance reconstruction in `float64` as specified in the competition guidelines. Do not attempt to fix this by "clipping" the network output; the Wishart likelihood is mathematically sensitive to the exact values, and `float64` is the only way to maintain the necessary dynamic range.
+
+**2. Critique of the Loss Function:**
+Your weighted MSE loss $w_\ell = 1 / (C_{\ell, \text{fiducial}}^2)$ is problematic. By weighting by the inverse of the *squared* spectrum, you are effectively performing a relative error minimization. While this helps with the dynamic range, it over-penalizes the high-$\ell$ regime where the signal is dominated by numerical noise and the physical information content is lower. Given that the competition metric is the Wishart likelihood, you should transition to a loss function that more closely approximates the log-likelihood gradient. A better approach is to minimize the MSE of the *log-spectra* directly, which naturally handles the dynamic range without requiring arbitrary weighting schemes that may be misaligned with the Wishart covariance.
+
+**3. Simplify the Architecture:**
+You tested three architectures (512x4, 256x3, 512x2). The 512x2 model performing worse than the 256x3 model suggests that your training process is sensitive to initialization or that the wider, shallower network is not converging as efficiently. Given the goal of simplicity and interpretability, stick to the 256x3 architecture. It is already below the 1 ms threshold; there is no need to further prune or complicate the model. Focus your effort on the stability of the training process rather than architectural search.
+
+**4. Data Augmentation Strategy:**
+You generated 50,000 additional samples. While this improves coverage, ensure that your validation set is truly independent. The report mentions a 10% validation split, but ensure this is strictly held out from the training process. If you continue to see high residuals at the edges of the parameter space, consider using a Sobol sequence or Latin Hypercube Sampling for the additional data generation rather than the default `generate_data` seed, to ensure better coverage of the parameter boundaries.
+
+**5. Actionable Next Steps:**
+- **Refactor `predict()`:** Immediately implement the `float64` casting for the output arrays. This is the single most important step to move from `NaN` to a valid `mae_total`.
+- **Loss Function Shift:** Replace the weighted MSE with a simple MSE on the log-transformed spectra. This is simpler, more robust, and likely to yield better precision at high $\ell$.
+- **Stop Over-Engineering:** You have already met the speed requirement. Do not spend further cycles on network pruning. Focus entirely on the precision score (`mae_total`) now that the numerical stability issue is identified.
+
+
+Respond in this format:
+
+\\begin{SUGGESTIONS}
+<SUGGESTIONS>
+\\end{SUGGESTIONS}
+
+In <SUGGESTIONS> put the suggestions to improve the plan.
+
+###### PROMPT ENDS ########
+
+\begin{SUGGESTIONS}
+1. **Refine the Loss Function for $\rho_\ell$**: While MSE on log-spectra is excellent for the diagonal elements ($C_\ell^{TT}, C_\ell^{EE}, C_\ell^{PP}$), the correlation coefficient $\rho_\ell$ is bounded by $(-1, 1)$. Ensure the loss function for $\rho_\ell$ uses a transformation (e.g., `atanh`) or a specific activation (e.g., `tanh`) to keep the output in the valid range, and consider if a simple MSE on the raw $\rho_\ell$ is sufficient or if it requires a different scaling to match the sensitivity of the Wishart likelihood.
+
+2. **Explicitly Handle the $\ell < 2$ constraint**: The data description notes that $\ell=0$ and $\ell=1$ are ignored by the scorer but must be present. Ensure your `predict` method explicitly fills these indices with dummy values (e.g., zeros or the fiducial values) to maintain the required array shape (6001,) without affecting the likelihood calculation.
+
+3. **Validation Strategy**: To avoid test set leakage, ensure the 5,000-point validation set is generated once and saved to disk. Use this fixed set for all hyperparameter tuning and early stopping decisions. Do not use the competition's `cec.get_accuracy_score` (which uses the hidden test set) during the training loop; only use it as a final verification step.
+
+4. **JAX/CPU Environment Management**: Since the scorer requires `os.environ['JAX_PLATFORMS'] = 'cpu'` for the timing benchmark, ensure your training script (which requires GPU) and your benchmarking script (which requires CPU) are distinct. Do not attempt to switch platforms within the same process.
+
+5. **Precision Monitoring**: Since `mae_total` is the primary metric, consider implementing a custom callback that computes the `mae_total` on your local validation set every 20 epochs. This will allow you to track the actual competition metric rather than a proxy loss, providing a clearer signal for when to stop training.
+\end{SUGGESTIONS}
+
