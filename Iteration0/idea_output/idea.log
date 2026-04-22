@@ -1,0 +1,2265 @@
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: You are a Senior Scientific Researcher.
+**Objective**: Based on the provided dataset description and potential previous ideas, generate 10 distinct, high-impact research ideas for a scientific project. 
+
+**Task**: 
+Generate 10 research ideas that could lead to meaningful scientific discovery. These ideas must be diverse in their approach to the data and must be different to previous existing ideas.
+
+**Operational Constraints**:
+- We are trying to sample the ideas space as widely as possible. Thus, if there are existing ideas, make the 10 ideas as different as possible from the existing ones.
+- The 10 ideas should also be as different from each other as possible.
+- **Conciseness**: Each idea should be 3-4 sentences max. Focus on the "Research Question," not the execution.
+- **No Methodology**: Do not include plans, code, or specific algorithms. Only state the *Research Objective*.
+- **Consistency**: The ideas must strictly adhere to the constraints and physical reality described in the data description.
+- **Zero Redundancy**: If two ideas feel similar, discard one and find a new scientific angle.
+- Each idea must consist of a title and a brief description of it.
+
+Data description:
+
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+
+
+
+
+
+
+
+Respond in the following format:
+
+\\begin{IDEAS}
+<IDEAS>
+\\end{IDEAS}
+
+In <IDEAS>, put the ideas you have generated. 
+
+###### PROMPT ENDS ########
+
+\begin{IDEAS}
+1. **Gradient-Based Sensitivity Mapping**: Investigate the local sensitivity of the CMB power spectra to cosmological parameters by computing the Jacobian of the emulator’s output with respect to its inputs. This research objective aims to identify which regions of the multipole space ($ \ell $) are most diagnostic for specific parameters like $ \tau_{\text{reio}} $ or $ n_s $.
+
+2. **Cross-Spectrum Feature Extraction via Manifold Learning**: Map the high-dimensional output spectra into a lower-dimensional latent manifold to determine if the 4 spectra (TT, TE, EE, PP) share a common geometric structure. The objective is to quantify the degree of redundancy between the primary CMB spectra and the lensing potential, potentially revealing nonlinear correlations not captured by standard linear likelihoods.
+
+3. **Information Bottleneck in Spectral Reconstruction**: Quantify the minimal latent representation required to reconstruct the CMB spectra within the desired likelihood-level accuracy. This objective seeks to identify the theoretical information limit of the $\Lambda$CDM model, testing whether the 6-parameter input space can be compressed further without losing observational information.
+
+4. **Emulator Uncertainty Quantification for Out-of-Distribution (OOD) Scenarios**: Develop a framework to assess the emulator's predictive confidence when extrapolating beyond the provided parameter box bounds. The research objective is to determine where the mapping fails to maintain physical consistency, providing a robust metric for the validity of the $\Lambda$CDM framework under extreme parameter shifts.
+
+5. **Spectral Saliency and Non-Gaussianity Detection**: Analyze the emulator’s internal attention weights or activations to identify which multipole ranges contribute most significantly to the recovery of specific cosmological parameters. The goal is to determine if the emulator relies on global spectral shapes or localized features (e.g., acoustic peaks) to distinguish between parameter configurations.
+
+6. **Transfer Learning for Non-Standard Cosmologies**: Evaluate if an emulator trained on the $\Lambda$CDM dataset can serve as a "base model" for predicting spectra in models with extended physics (e.g., varying neutrino masses). The objective is to determine if the internal representation of the CMB physics is transferable, effectively reducing the training data requirements for new cosmological models.
+
+7. **Symmetry-Preserving Spectral Emulation**: Investigate whether enforcing physical symmetries—such as the parity properties of the TE cross-spectrum—directly in the emulator architecture improves convergence and accuracy. This research objective tests if prior knowledge of the underlying Boltzmann physics can replace purely data-driven feature learning.
+
+8. **Parameter Degeneracy Quantification via Emulator Inversion**: Utilize the trained emulator as a surrogate model to perform rapid MCMC sampling, aiming to map the full degeneracy surface between $H_0$ and $\Omega_c$. The objective is to quantify the "width" of the parameter posterior distributions and identify if specific spectral segments are responsible for breaking existing degeneracies.
+
+9. **Multi-Scale Spectral Decomposition**: Apply a wavelet-based decomposition to the spectra before training to determine if the emulator performs better when learning features at different $\ell$ resolutions independently. The objective is to isolate whether the emulator struggles more with high-$\ell$ damping tails or low-$\ell$ acoustic peaks, informing future architecture designs.
+
+10. **Emulator-Driven Active Learning for Cosmological Surveys**: Develop a strategy to identify the most "informative" regions of the 6-parameter space that, if sampled with high-fidelity Boltzmann solvers, would most drastically reduce the emulator's global error. This objective focuses on optimizing future simulation budgets by targeting the parameters that induce the highest spectral variance.
+\end{IDEAS}
+
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: Senior Scientific Lead and Final Decision Maker.
+**Objective**: Review the ideas prioritized by the three independent Reviewer Agents and select the single most promising research project to proceed to the implementation phase.
+
+**Context**: 
+A pool of 10 initial ideas was generated. Three independent agents have evaluated those ideas and identified their top selections (provided below). Your role is to serve as the final filter, selecting the "Best of the Best" based on scientific merit and the constraints of the dataset.
+
+**Evaluation Criteria**:
+1. **Scientific Consensus**: Does an idea appear as a top choice for multiple reviewers?
+2. **Execution Readiness**: Given the 'Data Description,' which idea is most likely to produce a valid, non-erroneous scientific result?
+3. **Strategic Impact**: Which project offers the most meaningful contribution to the Foundation's research goals?
+4. **Novelty vs Previous Work**: The selected idea should be as different as possible from any previous ideas to ensure new scientific contributions.
+
+**Operational Constraints**:
+- **Selection Only**: You must select exactly one idea.
+- **Strict Fidelity**: Do not modify, rephrase, or correct the original text of the idea. 
+- **Zero Commentary**: Do not justify your decision, provide pros/cons, or offer any introductory text.
+- **Output Integrity**: Provide **only** the text of the selected idea within the required tags.
+- The selected idea must contain a title and a description of the idea
+
+Data description:
+
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+
+Ideas:
+Idea selected1: **Gradient-Based Sensitivity Mapping**: Investigate the local sensitivity of the CMB power spectra to cosmological parameters by computing the Jacobian of the emulator’s output with respect to its inputs. This research objective aims to identify which regions of the multipole space ($ \ell $) are most diagnostic for specific parameters like $ \tau_{\text{reio}} $ or $ n_s $.
+Idea selected2: **Gradient-Based Sensitivity Mapping**: Investigate the local sensitivity of the CMB power spectra to cosmological parameters by computing the Jacobian of the emulator’s output with respect to its inputs. This research objective aims to identify which regions of the multipole space ($ \ell $) are most diagnostic for specific parameters like $ \tau_{\text{reio}} $ or $ n_s $.
+Idea selected3: **Gradient-Based Sensitivity Mapping**: Investigate the local sensitivity of the CMB power spectra to cosmological parameters by computing the Jacobian of the emulator’s output with respect to its inputs. This research objective aims to identify which regions of the multipole space ($ \ell $) are most diagnostic for specific parameters like $ \tau_{\text{reio}} $ or $ n_s $.
+
+
+
+
+
+
+
+Respond in exactly the following format:
+
+\\begin{IDEA}
+<IDEA>
+\\end{IDEA}
+
+In <IDEA>, put the idea you have selected
+
+###### PROMPT ENDS ########
+
+\begin{IDEA}
+Gradient-Based Sensitivity Mapping: Investigate the local sensitivity of the CMB power spectra to cosmological parameters by computing the Jacobian of the emulator’s output with respect to its inputs. This research objective aims to identify which regions of the multipole space ($ \ell $) are most diagnostic for specific parameters like $ \tau_{\text{reio}} $ or $ n_s $.
+\end{IDEA}
+
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: Skeptical Red Team Reviewer and Scientific Auditor.
+**Objective**: Conduct a rigorous "Stress Test" on the proposed research idea to identify fatal flaws, feasibility gaps, and potential scientific "slop."
+
+**Evaluation Criteria**:
+1. **Data-Hypothesis Alignment**: Does the dataset described actually contain the variables and precision required to test this idea?
+2. **Feasibility & Noise**: Is the signal-to-noise ratio realistic? Is the idea too ambitious for the provided data?
+3. **Redundancy Check**: Does this idea simply repeat a "standard" analysis, or is it a meaningful contribution?
+4. **Physical Reality**: Does the idea violate any constraints or physical laws mentioned in the data description?
+
+**Task**:
+- Critically analyze the "Current Idea" against the "Data Description."
+- If the idea is **unfeasible**, explicitly state why and suggest a "Strategic Pivot" (a new direction that *is* supported by the data).
+- If the idea is **feasible but weak**, identify the specific "weak links" in the logic.
+- Compare it against "Previous Ideas" to ensure the refinement loop is moving forward, not backward.
+
+**Operational Constraints**:
+- **Tone**: Be professional, objective, and intellectually demanding. 
+- **Brevity**: Use high-density bullet points. Do not waste words on pleasantries.
+- **Strict Adherence**: Every criticism must be grounded in the provided 'Data Description.'
+
+**Input Data**:
+- **Data Description**: 
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+- **Current Idea**: Gradient-Based Sensitivity Mapping: Investigate the local sensitivity of the CMB power spectra to cosmological parameters by computing the Jacobian of the emulator’s output with respect to its inputs. This research objective aims to identify which regions of the multipole space ($ \ell $) are most diagnostic for specific parameters like $ \tau_{\text{reio}} $ or $ n_s $.    
+
+Respond in the following format:
+
+\\begin{CRITIC}
+<CRITIC>
+\\end{CRITIC}
+
+In <CRITIC>, put your criticism to the idea. Try to be brief in the description.
+
+###### PROMPT ENDS ########
+
+\begin{CRITIC}
+* **Data-Hypothesis Alignment**: The dataset is designed for *emulation* (mapping parameters to spectra), not *inference* (mapping spectra to parameters). While the Jacobian $\partial C_\ell / \partial \theta_i$ is mathematically computable via JAX, the emulator's accuracy is only guaranteed within the training distribution. Sensitivity maps derived from an emulator are artifacts of the model's interpolation, not necessarily physical reality.
+* **Feasibility & Noise**: The signal-to-noise ratio of the Jacobian is highly dependent on the emulator's local smoothness. If the MLP architecture is not specifically constrained to be differentiable (e.g., using high-order activation functions like Swish/GELU), the Jacobian will be noisy and potentially misleading for small $\ell$ ranges.
+* **Redundancy Check**: This is a standard "Fisher Information" analysis disguised as a novel sensitivity study. It does not contribute to the primary objective of the competition: minimizing `mae_total` and `t_cpu_ms`.
+* **Strategic Pivot**: Abandon the sensitivity mapping. Focus on **Multi-Head Architecture Optimization**. Given the distinct physical origins of $C_\ell^{TT, TE, EE}$ (recombination) vs $C_\ell^{\phi\phi}$ (lensing), a single monolithic MLP is inefficient. Implement a branched architecture where the encoder (6 inputs) feeds into specialized heads for CMB and Lensing, allowing for different depth/width scaling to minimize `mae_total` while keeping the inference path lean for `t_cpu_ms`.
+\end{CRITIC}
+
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: Senior Research Scientific.
+**Objective**: Synthesize a primary research idea with expert criticism to produce a refined, groundbreaking, and technically feasible scientific objective.
+
+**Task**:
+You are in an iterative refinement loop (Iteration: 0). Your goal is to take the "Previous Idea," pass it through the filter of the "Critiques," and produce a "Hardened Idea" that is more scientifically rigorous and original than its predecessor.
+
+**Refinement Principles**:
+1. **Address Caveats**: If the critic mentioned a lack of feasibility, adjust the scope of the idea to fit the 'Data Description.'
+2. **Increase Specificity**: Move away from generic goals. Use the statistics and variables found in the data description to make the idea more concrete.
+3. **Internalize Feedback**: Do not explicitly mention the criticism or explain your changes. Instead, weave the solutions directly into the new version of the idea.
+4. **Maintain Grounding**: Ensure the "groundbreaking" aspect remains physically possible within the provided dataset's constraints.
+
+**Operational Constraints**:
+- **Brevity**: Keep the description concise but high-density (max 6 sentences).
+- **Format**: Do not include introductory text or meta-commentary about the process.
+- **Fidelity**: Stick strictly to the guidelines and physical realities described in the data description.
+- The idea must contain a title and a description of the idea
+
+**Input Data**:
+- **Data Description**: 
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+- **Critical Feedback**: * **Data-Hypothesis Alignment**: The dataset is designed for *emulation* (mapping parameters to spectra), not *inference* (mapping spectra to parameters). While the Jacobian $\partial C_\ell / \partial \theta_i$ is mathematically computable via JAX, the emulator's accuracy is only guaranteed within the training distribution. Sensitivity maps derived from an emulator are artifacts of the model's interpolation, not necessarily physical reality.
+* **Feasibility & Noise**: The signal-to-noise ratio of the Jacobian is highly dependent on the emulator's local smoothness. If the MLP architecture is not specifically constrained to be differentiable (e.g., using high-order activation functions like Swish/GELU), the Jacobian will be noisy and potentially misleading for small $\ell$ ranges.
+* **Redundancy Check**: This is a standard "Fisher Information" analysis disguised as a novel sensitivity study. It does not contribute to the primary objective of the competition: minimizing `mae_total` and `t_cpu_ms`.
+* **Strategic Pivot**: Abandon the sensitivity mapping. Focus on **Multi-Head Architecture Optimization**. Given the distinct physical origins of $C_\ell^{TT, TE, EE}$ (recombination) vs $C_\ell^{\phi\phi}$ (lensing), a single monolithic MLP is inefficient. Implement a branched architecture where the encoder (6 inputs) feeds into specialized heads for CMB and Lensing, allowing for different depth/width scaling to minimize `mae_total` while keeping the inference path lean for `t_cpu_ms`.
+
+Respond in the following format:
+
+\\begin{IDEA}
+<IDEA>
+\\end{IDEA}
+
+In <IDEA>, put the refined idea. 
+
+###### PROMPT ENDS ########
+
+\begin{IDEA}
+**Title**: Decoupled Multi-Head Residual Emulator for CMB and Lensing Spectra
+
+**Description**: To minimize `mae_total` while maintaining sub-millisecond CPU inference, this architecture employs a shared 6-input bottleneck layer that branches into two specialized sub-networks: a high-capacity CMB branch (TT, TE, EE) and a compact Lensing branch (PP). By utilizing GELU-activated residual blocks, the model ensures the local smoothness required for high-fidelity spectral reconstruction while optimizing parameter-to-target mapping efficiency. The CMB branch is configured with a wider hidden dimension (512) to capture the complex acoustic oscillation features, while the PP branch utilizes a shallower depth to reflect the distinct, smoother physical origin of the lensing potential. This bifurcation allows for independent weight optimization, reducing the overall parameter count and latency compared to monolithic architectures. Final inference is performed using a consolidated, jit-compiled graph to ensure the combined `mae_total` and CPU timing scores are minimized within the `cec.get_score` framework.
+\end{IDEA}
+
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: Skeptical Red Team Reviewer and Scientific Auditor.
+**Objective**: Conduct a rigorous "Stress Test" on the proposed research idea to identify fatal flaws, feasibility gaps, and potential scientific "slop."
+
+**Evaluation Criteria**:
+1. **Data-Hypothesis Alignment**: Does the dataset described actually contain the variables and precision required to test this idea?
+2. **Feasibility & Noise**: Is the signal-to-noise ratio realistic? Is the idea too ambitious for the provided data?
+3. **Redundancy Check**: Does this idea simply repeat a "standard" analysis, or is it a meaningful contribution?
+4. **Physical Reality**: Does the idea violate any constraints or physical laws mentioned in the data description?
+
+**Task**:
+- Critically analyze the "Current Idea" against the "Data Description."
+- If the idea is **unfeasible**, explicitly state why and suggest a "Strategic Pivot" (a new direction that *is* supported by the data).
+- If the idea is **feasible but weak**, identify the specific "weak links" in the logic.
+- Compare it against "Previous Ideas" to ensure the refinement loop is moving forward, not backward.
+
+**Operational Constraints**:
+- **Tone**: Be professional, objective, and intellectually demanding. 
+- **Brevity**: Use high-density bullet points. Do not waste words on pleasantries.
+- **Strict Adherence**: Every criticism must be grounded in the provided 'Data Description.'
+
+**Input Data**:
+- **Data Description**: 
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+- **Current Idea**: **Title**: Decoupled Multi-Head Residual Emulator for CMB and Lensing Spectra
+
+**Description**: To minimize `mae_total` while maintaining sub-millisecond CPU inference, this architecture employs a shared 6-input bottleneck layer that branches into two specialized sub-networks: a high-capacity CMB branch (TT, TE, EE) and a compact Lensing branch (PP). By utilizing GELU-activated residual blocks, the model ensures the local smoothness required for high-fidelity spectral reconstruction while optimizing parameter-to-target mapping efficiency. The CMB branch is configured with a wider hidden dimension (512) to capture the complex acoustic oscillation features, while the PP branch utilizes a shallower depth to reflect the distinct, smoother physical origin of the lensing potential. This bifurcation allows for independent weight optimization, reducing the overall parameter count and latency compared to monolithic architectures. Final inference is performed using a consolidated, jit-compiled graph to ensure the combined `mae_total` and CPU timing scores are minimized within the `cec.get_score` framework.
+- **Previous Versions (for context)**: 
+
+
+Iteration 0:
+Idea: **Title**: Decoupled Multi-Head Residual Emulator for CMB and Lensing Spectra
+
+**Description**: To minimize `mae_total` while maintaining sub-millisecond CPU inference, this architecture employs a shared 6-input bottleneck layer that branches into two specialized sub-networks: a high-capacity CMB branch (TT, TE, EE) and a compact Lensing branch (PP). By utilizing GELU-activated residual blocks, the model ensures the local smoothness required for high-fidelity spectral reconstruction while optimizing parameter-to-target mapping efficiency. The CMB branch is configured with a wider hidden dimension (512) to capture the complex acoustic oscillation features, while the PP branch utilizes a shallower depth to reflect the distinct, smoother physical origin of the lensing potential. This bifurcation allows for independent weight optimization, reducing the overall parameter count and latency compared to monolithic architectures. Final inference is performed using a consolidated, jit-compiled graph to ensure the combined `mae_total` and CPU timing scores are minimized within the `cec.get_score` framework.
+    
+
+Respond in the following format:
+
+\\begin{CRITIC}
+<CRITIC>
+\\end{CRITIC}
+
+In <CRITIC>, put your criticism to the idea. Try to be brief in the description.
+
+###### PROMPT ENDS ########
+
+\begin{CRITIC}
+*   **Redundancy/Stagnation**: The "Current Idea" is identical to "Iteration 0." No refinement has occurred. This indicates a lack of progress in the optimization loop.
+*   **Feasibility Gap (Architecture)**: The proposal suggests "independent weight optimization" for branches. If the branches are trained independently, you lose the ability to capture cross-correlations (e.g., the physical coupling between CMB lensing and primary anisotropies) that a monolithic or shared-latent space model naturally learns.
+*   **Weak Link (Inference Latency)**: You claim "sub-millisecond CPU inference" but propose a complex multi-head residual architecture. Residual blocks and wide hidden layers (512) increase FLOPs. Without a specific plan for pruning or weight quantization, this architecture is likely to exceed the `get_time_score` latency budget.
+*   **Data-Hypothesis Alignment**: The dataset provides 50,000 samples (expandable to 100,000). A 512-width MLP is prone to overfitting on this volume unless aggressive regularization is specified. The proposal lacks a strategy for handling the disparate dynamic ranges of TT/EE vs. PP spectra.
+*   **Strategic Pivot**: 
+    *   **Abandon** the "independent branch" approach; use a shared latent space (bottleneck) to capture the underlying $\Lambda$CDM manifold, then use lightweight, task-specific linear heads for the final mapping.
+    *   **Prioritize** a "Student-Teacher" distillation or a smaller, deeper architecture (e.g., 4-6 layers of 256 width) to ensure the `get_time_score` remains competitive.
+    *   **Implement** a weighted loss function that accounts for the different scales of the four spectra (TT, TE, EE, PP) to prevent the high-amplitude TT spectrum from dominating the gradient updates.
+\end{CRITIC}
+
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: Senior Research Scientific.
+**Objective**: Synthesize a primary research idea with expert criticism to produce a refined, groundbreaking, and technically feasible scientific objective.
+
+**Task**:
+You are in an iterative refinement loop (Iteration: 1). Your goal is to take the "Previous Idea," pass it through the filter of the "Critiques," and produce a "Hardened Idea" that is more scientifically rigorous and original than its predecessor.
+
+**Refinement Principles**:
+1. **Address Caveats**: If the critic mentioned a lack of feasibility, adjust the scope of the idea to fit the 'Data Description.'
+2. **Increase Specificity**: Move away from generic goals. Use the statistics and variables found in the data description to make the idea more concrete.
+3. **Internalize Feedback**: Do not explicitly mention the criticism or explain your changes. Instead, weave the solutions directly into the new version of the idea.
+4. **Maintain Grounding**: Ensure the "groundbreaking" aspect remains physically possible within the provided dataset's constraints.
+
+**Operational Constraints**:
+- **Brevity**: Keep the description concise but high-density (max 6 sentences).
+- **Format**: Do not include introductory text or meta-commentary about the process.
+- **Fidelity**: Stick strictly to the guidelines and physical realities described in the data description.
+- The idea must contain a title and a description of the idea
+
+**Input Data**:
+- **Data Description**: 
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+- **Previous Versions**: 
+
+
+Iteration 0:
+Idea: **Title**: Decoupled Multi-Head Residual Emulator for CMB and Lensing Spectra
+
+**Description**: To minimize `mae_total` while maintaining sub-millisecond CPU inference, this architecture employs a shared 6-input bottleneck layer that branches into two specialized sub-networks: a high-capacity CMB branch (TT, TE, EE) and a compact Lensing branch (PP). By utilizing GELU-activated residual blocks, the model ensures the local smoothness required for high-fidelity spectral reconstruction while optimizing parameter-to-target mapping efficiency. The CMB branch is configured with a wider hidden dimension (512) to capture the complex acoustic oscillation features, while the PP branch utilizes a shallower depth to reflect the distinct, smoother physical origin of the lensing potential. This bifurcation allows for independent weight optimization, reducing the overall parameter count and latency compared to monolithic architectures. Final inference is performed using a consolidated, jit-compiled graph to ensure the combined `mae_total` and CPU timing scores are minimized within the `cec.get_score` framework.
+
+- **Critical Feedback**: *   **Redundancy/Stagnation**: The "Current Idea" is identical to "Iteration 0." No refinement has occurred. This indicates a lack of progress in the optimization loop.
+*   **Feasibility Gap (Architecture)**: The proposal suggests "independent weight optimization" for branches. If the branches are trained independently, you lose the ability to capture cross-correlations (e.g., the physical coupling between CMB lensing and primary anisotropies) that a monolithic or shared-latent space model naturally learns.
+*   **Weak Link (Inference Latency)**: You claim "sub-millisecond CPU inference" but propose a complex multi-head residual architecture. Residual blocks and wide hidden layers (512) increase FLOPs. Without a specific plan for pruning or weight quantization, this architecture is likely to exceed the `get_time_score` latency budget.
+*   **Data-Hypothesis Alignment**: The dataset provides 50,000 samples (expandable to 100,000). A 512-width MLP is prone to overfitting on this volume unless aggressive regularization is specified. The proposal lacks a strategy for handling the disparate dynamic ranges of TT/EE vs. PP spectra.
+*   **Strategic Pivot**: 
+    *   **Abandon** the "independent branch" approach; use a shared latent space (bottleneck) to capture the underlying $\Lambda$CDM manifold, then use lightweight, task-specific linear heads for the final mapping.
+    *   **Prioritize** a "Student-Teacher" distillation or a smaller, deeper architecture (e.g., 4-6 layers of 256 width) to ensure the `get_time_score` remains competitive.
+    *   **Implement** a weighted loss function that accounts for the different scales of the four spectra (TT, TE, EE, PP) to prevent the high-amplitude TT spectrum from dominating the gradient updates.
+
+Respond in the following format:
+
+\\begin{IDEA}
+<IDEA>
+\\end{IDEA}
+
+In <IDEA>, put the refined idea. 
+
+###### PROMPT ENDS ########
+
+\begin{IDEA}
+**Title**: Latent Manifold Projection Emulator with Task-Weighted Multi-Head Decoding
+
+**Description**: This architecture utilizes a shared 6-input latent encoder (4 layers of 256 units with LayerNorm and GELU) to project cosmological parameters onto a compressed manifold that enforces cross-spectral correlations between the CMB anisotropies and the lensing potential. To prevent the high-amplitude TT spectrum from dominating optimization, we implement a loss function weighted by the inverse variance of each spectral component across the 100,000-sample training set. Four lightweight, task-specific linear heads map the latent space to the target 20,996-dimensional vector, ensuring minimal FLOPs for rapid CPU inference. The model is regularized via weight decay and dropout to prevent overfitting on the provided 50,000+ data points, maintaining high accuracy without the latency penalties of deep residual architectures. By decoupling the feature extraction from the final mapping, the emulator achieves likelihood-level precision while strictly adhering to the `get_time_score` constraints.
+\end{IDEA}
+
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: Skeptical Red Team Reviewer and Scientific Auditor.
+**Objective**: Conduct a rigorous "Stress Test" on the proposed research idea to identify fatal flaws, feasibility gaps, and potential scientific "slop."
+
+**Evaluation Criteria**:
+1. **Data-Hypothesis Alignment**: Does the dataset described actually contain the variables and precision required to test this idea?
+2. **Feasibility & Noise**: Is the signal-to-noise ratio realistic? Is the idea too ambitious for the provided data?
+3. **Redundancy Check**: Does this idea simply repeat a "standard" analysis, or is it a meaningful contribution?
+4. **Physical Reality**: Does the idea violate any constraints or physical laws mentioned in the data description?
+
+**Task**:
+- Critically analyze the "Current Idea" against the "Data Description."
+- If the idea is **unfeasible**, explicitly state why and suggest a "Strategic Pivot" (a new direction that *is* supported by the data).
+- If the idea is **feasible but weak**, identify the specific "weak links" in the logic.
+- Compare it against "Previous Ideas" to ensure the refinement loop is moving forward, not backward.
+
+**Operational Constraints**:
+- **Tone**: Be professional, objective, and intellectually demanding. 
+- **Brevity**: Use high-density bullet points. Do not waste words on pleasantries.
+- **Strict Adherence**: Every criticism must be grounded in the provided 'Data Description.'
+
+**Input Data**:
+- **Data Description**: 
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+- **Current Idea**: **Title**: Latent Manifold Projection Emulator with Task-Weighted Multi-Head Decoding
+
+**Description**: This architecture utilizes a shared 6-input latent encoder (4 layers of 256 units with LayerNorm and GELU) to project cosmological parameters onto a compressed manifold that enforces cross-spectral correlations between the CMB anisotropies and the lensing potential. To prevent the high-amplitude TT spectrum from dominating optimization, we implement a loss function weighted by the inverse variance of each spectral component across the 100,000-sample training set. Four lightweight, task-specific linear heads map the latent space to the target 20,996-dimensional vector, ensuring minimal FLOPs for rapid CPU inference. The model is regularized via weight decay and dropout to prevent overfitting on the provided 50,000+ data points, maintaining high accuracy without the latency penalties of deep residual architectures. By decoupling the feature extraction from the final mapping, the emulator achieves likelihood-level precision while strictly adhering to the `get_time_score` constraints.
+- **Previous Versions (for context)**: 
+
+
+
+Iteration 0:
+Idea: **Title**: Decoupled Multi-Head Residual Emulator for CMB and Lensing Spectra
+
+**Description**: To minimize `mae_total` while maintaining sub-millisecond CPU inference, this architecture employs a shared 6-input bottleneck layer that branches into two specialized sub-networks: a high-capacity CMB branch (TT, TE, EE) and a compact Lensing branch (PP). By utilizing GELU-activated residual blocks, the model ensures the local smoothness required for high-fidelity spectral reconstruction while optimizing parameter-to-target mapping efficiency. The CMB branch is configured with a wider hidden dimension (512) to capture the complex acoustic oscillation features, while the PP branch utilizes a shallower depth to reflect the distinct, smoother physical origin of the lensing potential. This bifurcation allows for independent weight optimization, reducing the overall parameter count and latency compared to monolithic architectures. Final inference is performed using a consolidated, jit-compiled graph to ensure the combined `mae_total` and CPU timing scores are minimized within the `cec.get_score` framework.
+
+
+Iteration 1:
+Idea: **Title**: Latent Manifold Projection Emulator with Task-Weighted Multi-Head Decoding
+
+**Description**: This architecture utilizes a shared 6-input latent encoder (4 layers of 256 units with LayerNorm and GELU) to project cosmological parameters onto a compressed manifold that enforces cross-spectral correlations between the CMB anisotropies and the lensing potential. To prevent the high-amplitude TT spectrum from dominating optimization, we implement a loss function weighted by the inverse variance of each spectral component across the 100,000-sample training set. Four lightweight, task-specific linear heads map the latent space to the target 20,996-dimensional vector, ensuring minimal FLOPs for rapid CPU inference. The model is regularized via weight decay and dropout to prevent overfitting on the provided 50,000+ data points, maintaining high accuracy without the latency penalties of deep residual architectures. By decoupling the feature extraction from the final mapping, the emulator achieves likelihood-level precision while strictly adhering to the `get_time_score` constraints.
+    
+
+Respond in the following format:
+
+\\begin{CRITIC}
+<CRITIC>
+\\end{CRITIC}
+
+In <CRITIC>, put your criticism to the idea. Try to be brief in the description.
+
+###### PROMPT ENDS ########
+
+\begin{CRITIC}
+*   **Data-Hypothesis Alignment**: The "latent manifold" claim is unsubstantiated. The mapping from 6 parameters to 20,996 spectral points is a direct regression problem; there is no evidence that a "compressed manifold" (bottleneck) improves accuracy over a standard MLP, and it likely introduces information loss.
+*   **Feasibility & Noise**: The "inverse variance weighting" is a standard heuristic, but the proposal lacks a mechanism to handle the sign-flipping/zero-crossing nature of the $C_\ell^{TE}$ spectrum, which is not strictly positive and thus not log-transformable.
+*   **Redundancy Check**: The architecture (shared encoder + linear heads) is functionally identical to Iteration 0's "Decoupled Multi-Head" approach. It is a refinement of terminology, not a structural innovation.
+*   **Physical Reality**: The proposal ignores the high-frequency oscillatory nature of the CMB spectra. A 4-layer 256-unit encoder is likely too shallow to capture the acoustic peak structure across 6,000 $\ell$-modes, risking high `mae_total` in the high-$\ell$ regime.
+*   **Strategic Pivot**: Abandon the "latent manifold" abstraction. Implement a **Deep Residual MLP (6 → 512 → 1024 → 1024 → 512 → 20996)** with skip connections. Use a **split-loss function**: MSE on log-transformed $D_\ell^{TT, EE, PP}$ and a separate Huber loss on linear $D_\ell^{TE}$ to handle its sign-indefinite nature. Focus on increasing depth rather than bottlenecking, as the CPU inference constraint is on the *total* FLOPs, which a 1024-wide MLP easily satisfies.
+\end{CRITIC}
+
+
+###### PROMPT BEGINS ########
+Human: 
+**Role**: Senior Research Scientific.
+**Objective**: Synthesize a primary research idea with expert criticism to produce a refined, groundbreaking, and technically feasible scientific objective.
+
+**Task**:
+You are in an iterative refinement loop (Iteration: 2). Your goal is to take the "Previous Idea," pass it through the filter of the "Critiques," and produce a "Hardened Idea" that is more scientifically rigorous and original than its predecessor.
+
+**Refinement Principles**:
+1. **Address Caveats**: If the critic mentioned a lack of feasibility, adjust the scope of the idea to fit the 'Data Description.'
+2. **Increase Specificity**: Move away from generic goals. Use the statistics and variables found in the data description to make the idea more concrete.
+3. **Internalize Feedback**: Do not explicitly mention the criticism or explain your changes. Instead, weave the solutions directly into the new version of the idea.
+4. **Maintain Grounding**: Ensure the "groundbreaking" aspect remains physically possible within the provided dataset's constraints.
+
+**Operational Constraints**:
+- **Brevity**: Keep the description concise but high-density (max 6 sentences).
+- **Format**: Do not include introductory text or meta-commentary about the process.
+- **Fidelity**: Stick strictly to the guidelines and physical realities described in the data description.
+- The idea must contain a title and a description of the idea
+
+**Input Data**:
+- **Data Description**: 
+# CMB Power Spectrum Emulator — Dataset Description (v2)
+
+## Overview
+
+Train a neural-network emulator that maps 6 ΛCDM cosmological parameters to four CMB angular power spectra (TT, TE, EE, φφ). The emulator is scored on precision (likelihood-level accuracy) and CPU inference speed via `cmbemu.get_score(emulator)`.
+
+## Package and Data Access
+
+The `cmbemu` package is installed in the Denario venv and must be imported as:
+```python
+import sys
+sys.path.insert(0, '/home/node/work/cmbemu/src/')
+import cmbemu as cec
+```
+
+Training data (50,000 cosmologies, pre-cached — no download needed):
+```python
+train = cec.load_train()
+# Returns a dict with keys: params, tt, te, ee, pp, box_lo, box_hi, param_names, lmax_cmb, lmax_pp
+```
+
+Cached file location (use directly with np.load if needed):
+- `/home/node/.cache/cmbemu/datasets--borisbolliet--cmbemu-competition-v1/snapshots/e45fd9a3f451038e3ce677a56f7f6cb81c8c47c9/train.npz`
+
+## Dataset Shapes and Units
+
+- `train['params']`: float32, shape (50000, 6) — cosmological parameters in physical units
+- `train['tt']`: float32, shape (50000, 6001) — C_ℓ^TT, ℓ = 0..6000, units K²
+- `train['te']`: float32, shape (50000, 6001) — C_ℓ^TE
+- `train['ee']`: float32, shape (50000, 6001) — C_ℓ^EE
+- `train['pp']`: float32, shape (50000, 3001) — C_ℓ^φφ, ℓ = 0..3000
+- `train['box_lo']`: float32, shape (6,) — parameter box lower bounds
+- `train['box_hi']`: float32, shape (6,) — parameter box upper bounds
+- `train['param_names']`: ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+Concrete parameter ranges:
+- omega_b:          [0.020, 0.025]
+- omega_cdm:        [0.090, 0.150]
+- H0:               [55.0,  85.0]
+- tau_reio:         [0.030, 0.100]
+- ln10^{10}A_s:     [2.700, 3.300]
+- n_s:              [0.920, 1.020]
+
+ℓ=0 and ℓ=1 entries are present but ignored by the scorer. Indices 2..6000 matter for CMB; 2..3000 for φφ.
+
+## Emulator Interface
+
+```python
+class MyEmulator:
+    def predict(self, params: dict) -> dict:
+        # params: {'omega_b': float, 'omega_cdm': float, 'H0': float,
+        #          'tau_reio': float, 'ln10^{10}A_s': float, 'n_s': float}
+        # returns: {'tt': np.ndarray (6001,), 'te': np.ndarray (6001,),
+        #           'ee': np.ndarray (6001,), 'pp': np.ndarray (3001,)}
+        ...
+```
+
+## Scoring
+
+```python
+acc = cec.get_accuracy_score(emu)   # precision only, fast
+tim = cec.get_time_score(emu)       # CPU timing (single-threaded)
+full = cec.get_score(emu)           # combined_S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))
+```
+
+Baseline (ConstantPlanck): mae_total ≈ 1.13×10⁷. Any real emulator should achieve mae_total << 10⁶.
+
+## ═══════════════════════════════════════════════
+## MANDATORY: GPU SETUP FOR TRAINING
+## ═══════════════════════════════════════════════
+
+Every training script MUST begin with the following lines — BEFORE any other imports — to force JAX onto the GPU:
+
+```python
+import os
+os.environ['JAX_PLATFORMS'] = 'cuda'  # MUST be before importing jax
+import jax
+# Verify GPU is active:
+assert len([d for d in jax.devices() if 'cuda' in str(d).lower()]) > 0, \
+    f"GPU not found, devices = {jax.devices()}"
+print("Training on:", jax.devices())
+```
+
+This snippet has been tested and confirmed to work in this environment:
+- Hardware: 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM, CUDA 13.0
+- JAX 0.10.0 with jax-cuda12-plugin 0.10.0 installed
+- Expected output: `Training on: [CudaDevice(id=0)]`
+
+The env var must be set BEFORE `import jax`. Setting it after will have no effect. Do not use `jax.config.update('jax_platform_name', 'gpu')` — it is deprecated. Use only the `os.environ` approach above.
+
+For scoring/timing, JAX must be pinned to CPU (scorer requirement):
+```python
+os.environ['JAX_PLATFORMS'] = 'cpu'
+```
+Set this at the top of any script that calls `cec.get_time_score` or `cec.get_score`. The accuracy scorer (`cec.get_accuracy_score`) can run on GPU.
+
+## ═══════════════════════════════════════════════
+## RECOMMENDED APPROACH: DIRECT LOG-Dℓ EMULATION
+## ═══════════════════════════════════════════════
+
+The recommended approach is to emulate Dℓ = ℓ(ℓ+1)Cℓ/(2π) in log space. This is simpler, numerically stable, and avoids complex inverse-transform bugs.
+
+### Step 1: Preprocessing (do once, save to disk)
+
+```python
+import numpy as np
+train = cec.load_train()
+
+ell_cmb = np.arange(6001)
+ell_pp  = np.arange(3001)
+factor_cmb = np.where(ell_cmb >= 2, ell_cmb*(ell_cmb+1)/(2*np.pi), 1.0)
+factor_pp  = np.where(ell_pp  >= 2, ell_pp *(ell_pp +1)/(2*np.pi), 1.0)
+
+# Convert Cℓ → Dℓ (ℓ ≥ 2 only; ℓ=0,1 are zero/irrelevant)
+D_tt = train['tt'] * factor_cmb   # shape (N, 6001)
+D_te = train['te'] * factor_cmb
+D_ee = train['ee'] * factor_cmb
+D_pp = train['pp'] * factor_pp    # shape (N, 3001)
+
+# Log-transform (all Dℓ spectra are positive for ℓ ≥ 2, except TE which can be negative)
+# For TT, EE, PP: take log. For TE: keep linear or use asinh.
+log_D_tt = np.log(D_tt[:, 2:])   # shape (N, 5999)
+log_D_ee = np.log(D_ee[:, 2:])
+log_D_pp = np.log(D_pp[:, 2:])   # shape (N, 2999)
+D_te_lin = D_te[:, 2:]           # shape (N, 5999) — keep linear for TE
+
+# Concatenate into flat target vector
+targets_raw = np.concatenate([log_D_tt, D_te_lin, log_D_ee, log_D_pp], axis=1)
+# Shape: (N, 5999 + 5999 + 5999 + 2999) = (N, 20996)
+
+# Normalize inputs: min-max scale to [0, 1]
+box_lo = train['box_lo']  # shape (6,)
+box_hi = train['box_hi']
+X = (train['params'] - box_lo) / (box_hi - box_lo)   # shape (N, 6), range [0,1]
+
+# Standardize targets: zero mean, unit variance
+target_mean = targets_raw.mean(axis=0)   # shape (20996,)
+target_std  = targets_raw.std(axis=0)
+target_std  = np.where(target_std < 1e-8, 1e-8, target_std)
+Y = (targets_raw - target_mean) / target_std   # shape (N, 20996)
+```
+
+### Step 2: The predict() method — CRITICAL
+
+The predict() method must invert ALL preprocessing transforms. This is where bugs typically occur. Here is the exact inverse:
+
+```python
+PARAM_ORDER = ('omega_b', 'omega_cdm', 'H0', 'tau_reio', 'ln10^{10}A_s', 'n_s')
+
+def predict(self, params_dict: dict) -> dict:
+    # 1. Scale input parameters to [0, 1]
+    x = np.array([params_dict[k] for k in PARAM_ORDER], dtype=np.float32)
+    x_scaled = (x - self.box_lo) / (self.box_hi - self.box_lo)  # shape (6,)
+
+    # 2. Run neural network → standardized log-Dℓ predictions
+    y_std = self._nn_predict(x_scaled)   # shape (20996,)
+
+    # 3. Undo standardization
+    y_raw = y_std * self.target_std + self.target_mean   # shape (20996,)
+
+    # 4. Unpack the 4 segments
+    log_D_tt = y_raw[0:5999]
+    D_te_lin = y_raw[5999:11998]
+    log_D_ee = y_raw[11998:17997]
+    log_D_pp = y_raw[17997:20996]
+
+    # 5. Undo log transform
+    D_tt = np.exp(log_D_tt)   # shape (5999,)
+    D_ee = np.exp(log_D_ee)
+    D_pp = np.exp(log_D_pp)   # shape (2999,)
+    D_te = D_te_lin            # already linear
+
+    # 6. Convert Dℓ back to Cℓ: Cℓ = Dℓ / (ℓ(ℓ+1)/(2π))
+    ell_cmb = np.arange(2, 6001)
+    ell_pp  = np.arange(2, 3001)
+    factor_cmb = ell_cmb * (ell_cmb + 1) / (2 * np.pi)
+    factor_pp  = ell_pp  * (ell_pp  + 1) / (2 * np.pi)
+
+    C_tt = D_tt / factor_cmb   # shape (5999,)
+    C_te = D_te / factor_cmb
+    C_ee = D_ee / factor_cmb
+    C_pp = D_pp / factor_pp    # shape (2999,)
+
+    # 7. Pad ℓ=0,1 with zeros to restore full shape
+    pad2 = np.zeros(2, dtype=np.float32)
+    return {
+        'tt': np.concatenate([pad2, C_tt]).astype(np.float32),  # shape (6001,)
+        'te': np.concatenate([pad2, C_te]).astype(np.float32),
+        'ee': np.concatenate([pad2, C_ee]).astype(np.float32),
+        'pp': np.concatenate([np.zeros(2, dtype=np.float32), C_pp]).astype(np.float32),  # shape (3001,)
+    }
+```
+
+ALWAYS verify the predict() method is correct before training by running:
+```python
+# Sanity check: predict a training point and compare to ground truth
+i = 0
+params_dict = {k: float(train['params'][i, j]) for j, k in enumerate(PARAM_ORDER)}
+pred = emu.predict(params_dict)
+truth_tt = train['tt'][i]  # shape (6001,)
+rel_err_tt = np.abs(pred['tt'][2:] - truth_tt[2:]) / (np.abs(truth_tt[2:]) + 1e-30)
+print("Max relative TT error on training point:", rel_err_tt.max())
+# For a well-trained model this should be << 1. For a freshly initialized model it will be large.
+# If it's exactly identical to ConstantPlanck output, the inverse transform is wrong.
+```
+
+## Architecture Recommendations
+
+- MLP with 6→[512→512→512→512]→20996 (residual connections, LayerNorm, GELU)
+- Or: MLP encoder (6→256) + separate heads for TT/TE/EE (each 256→5999) and PP (256→2999)
+- Use mini-batches of 1024–4096 (GPU memory allows it)
+- Adam/AdamW with cosine LR schedule; ~200–500 epochs
+- Monitor `cec.get_accuracy_score` every 50 epochs on a held-out 5k validation set
+
+## Additional Data Generation
+
+```python
+# Generate 50k extra cosmologies (takes ~minutes on this machine)
+extra = cec.generate_data(n=50000, seed=99)
+# Returns same dict format as load_train()
+```
+
+## Hardware
+
+- 1× NVIDIA RTX PRO 6000 Blackwell, 96 GB VRAM
+- 64 CPU cores, 128 GB RAM
+- CUDA 13.0, JAX 0.10.0 + jax-cuda12-plugin
+- Use batch sizes of 4096–16384 to fully utilise GPU throughput
+
+- **Previous Versions**: 
+
+
+
+Iteration 0:
+Idea: **Title**: Decoupled Multi-Head Residual Emulator for CMB and Lensing Spectra
+
+**Description**: To minimize `mae_total` while maintaining sub-millisecond CPU inference, this architecture employs a shared 6-input bottleneck layer that branches into two specialized sub-networks: a high-capacity CMB branch (TT, TE, EE) and a compact Lensing branch (PP). By utilizing GELU-activated residual blocks, the model ensures the local smoothness required for high-fidelity spectral reconstruction while optimizing parameter-to-target mapping efficiency. The CMB branch is configured with a wider hidden dimension (512) to capture the complex acoustic oscillation features, while the PP branch utilizes a shallower depth to reflect the distinct, smoother physical origin of the lensing potential. This bifurcation allows for independent weight optimization, reducing the overall parameter count and latency compared to monolithic architectures. Final inference is performed using a consolidated, jit-compiled graph to ensure the combined `mae_total` and CPU timing scores are minimized within the `cec.get_score` framework.
+
+
+Iteration 1:
+Idea: **Title**: Latent Manifold Projection Emulator with Task-Weighted Multi-Head Decoding
+
+**Description**: This architecture utilizes a shared 6-input latent encoder (4 layers of 256 units with LayerNorm and GELU) to project cosmological parameters onto a compressed manifold that enforces cross-spectral correlations between the CMB anisotropies and the lensing potential. To prevent the high-amplitude TT spectrum from dominating optimization, we implement a loss function weighted by the inverse variance of each spectral component across the 100,000-sample training set. Four lightweight, task-specific linear heads map the latent space to the target 20,996-dimensional vector, ensuring minimal FLOPs for rapid CPU inference. The model is regularized via weight decay and dropout to prevent overfitting on the provided 50,000+ data points, maintaining high accuracy without the latency penalties of deep residual architectures. By decoupling the feature extraction from the final mapping, the emulator achieves likelihood-level precision while strictly adhering to the `get_time_score` constraints.
+
+- **Critical Feedback**: *   **Data-Hypothesis Alignment**: The "latent manifold" claim is unsubstantiated. The mapping from 6 parameters to 20,996 spectral points is a direct regression problem; there is no evidence that a "compressed manifold" (bottleneck) improves accuracy over a standard MLP, and it likely introduces information loss.
+*   **Feasibility & Noise**: The "inverse variance weighting" is a standard heuristic, but the proposal lacks a mechanism to handle the sign-flipping/zero-crossing nature of the $C_\ell^{TE}$ spectrum, which is not strictly positive and thus not log-transformable.
+*   **Redundancy Check**: The architecture (shared encoder + linear heads) is functionally identical to Iteration 0's "Decoupled Multi-Head" approach. It is a refinement of terminology, not a structural innovation.
+*   **Physical Reality**: The proposal ignores the high-frequency oscillatory nature of the CMB spectra. A 4-layer 256-unit encoder is likely too shallow to capture the acoustic peak structure across 6,000 $\ell$-modes, risking high `mae_total` in the high-$\ell$ regime.
+*   **Strategic Pivot**: Abandon the "latent manifold" abstraction. Implement a **Deep Residual MLP (6 → 512 → 1024 → 1024 → 512 → 20996)** with skip connections. Use a **split-loss function**: MSE on log-transformed $D_\ell^{TT, EE, PP}$ and a separate Huber loss on linear $D_\ell^{TE}$ to handle its sign-indefinite nature. Focus on increasing depth rather than bottlenecking, as the CPU inference constraint is on the *total* FLOPs, which a 1024-wide MLP easily satisfies.
+
+Respond in the following format:
+
+\\begin{IDEA}
+<IDEA>
+\\end{IDEA}
+
+In <IDEA>, put the refined idea. 
+
+###### PROMPT ENDS ########
+
+\begin{IDEA}
+**Title**: Residual Deep-Stack MLP with Hybrid Huber-Log Spectral Loss
+
+**Description**: This architecture employs a high-capacity residual MLP with a 6→512→1024→1024→512→20996 topology, utilizing GELU activations and LayerNorm to capture the high-frequency acoustic oscillations across 6,000 $\ell$-modes. To address the sign-indefinite nature of $C_\ell^{TE}$ while maintaining precision for the strictly positive $C_\ell^{TT, EE, PP}$, the training objective implements a dual-regime loss function: MSE on log-transformed $D_\ell$ for TT, EE, and PP, combined with a Huber loss on linear $D_\ell^{TE}$ to prevent gradient instability at zero-crossings. By increasing the depth to four primary residual blocks, the model maximizes feature extraction capability within the provided Blackwell GPU memory constraints. The final inference pipeline is optimized via JIT-compilation to satisfy CPU latency requirements, mapping inputs directly to the 20,996-dimensional spectral space without bottleneck-induced information loss. This approach ensures likelihood-level accuracy by optimizing the spectral reconstruction as a high-fidelity regression task rather than a dimensionality reduction problem.
+\end{IDEA}
+
