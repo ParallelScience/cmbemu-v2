@@ -1,0 +1,9 @@
+To improve the precision of the emulator beyond the current MLP baseline, I propose implementing a **Hybrid Residual-Basis Emulator**. Instead of predicting the raw log-spectra, the network will predict the coefficients of a low-rank basis expansion (e.g., a truncated Singular Value Decomposition or a set of Chebyshev polynomials) that captures the global shape of the power spectra, combined with a residual MLP that learns the high-frequency acoustic oscillations. 
+
+Specifically:
+1. **Basis Decomposition:** Perform an SVD on the training spectra to identify the top $K$ (e.g., 20–30) principal components that explain >99.9% of the variance. The network will output these $K$ coefficients, which are highly correlated with the cosmological parameters.
+2. **Residual Correction:** A lightweight MLP will predict the residual difference between the basis-reconstructed spectra and the true spectra. This forces the network to focus only on the "fine-tuning" of the acoustic peaks rather than the entire dynamic range of the power spectrum.
+3. **Log-Space Stability:** The residual correction will be applied in log-space to ensure positivity and numerical stability.
+4. **Loss Function:** Use a weighted MSE loss that incorporates the inverse of the variance across the training set, effectively acting as a proxy for the Wishart likelihood, ensuring the model prioritizes the high-precision regions of the spectra.
+
+This approach addresses the dynamic range issue by offloading the global spectral structure to a linear basis, allowing the MLP to dedicate its capacity to the non-linear, parameter-dependent shifts in the acoustic peaks, which is critical for achieving the target `mae_total < 10^4`.
