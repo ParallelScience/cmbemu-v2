@@ -1,0 +1,7 @@
+Instead of training a single monolithic MLP to predict the entire spectrum, we hypothesize that a "Multi-Scale Residual Emulator" will recover precision without sacrificing inference speed. 
+
+The strategy is to decompose the spectral prediction into two components: 
+1. A global, low-capacity MLP that predicts a "base" spectrum (capturing the broad, smooth features of the CMB power spectra).
+2. A set of small, specialized "residual" networks (or a single lightweight CNN/MLP with a multi-head output) that predict the high-frequency acoustic oscillations (residuals) at different multipole ranges (e.g., low-ℓ, mid-ℓ, and high-ℓ).
+
+By training the base model first and then freezing it to train the residual heads, we can focus the network's capacity on the high-frequency features that are currently being smoothed out by the 3x256 architecture. To maintain the sub-millisecond inference speed, we will use a "bottleneck" architecture where the residual heads share a common feature extraction layer but branch into specialized heads for TT, TE, EE, and PP. This approach leverages the fact that the CMB spectra are highly structured and dominated by acoustic peaks, allowing the model to learn the "physics" of the peaks as residuals rather than trying to map the entire dynamic range of the spectra from scratch. This should significantly reduce the MAE at high multipoles where the current model struggles, without increasing the total number of operations beyond the 1 ms threshold.
