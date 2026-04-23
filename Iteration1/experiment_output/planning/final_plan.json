@@ -1,0 +1,84 @@
+{
+    "sub_tasks": [
+        {
+            "bullet_points": [
+                "Import `cmbemu` and load the 50,000 training samples using `cec.load_train()`.",
+                "Generate an additional 50,000 samples using `cec.generate_data(n=50000, seed=99)`.",
+                "Combine the two datasets into a single dataset of 100,000 samples.",
+                "Normalize the cosmological parameters to the range [0, 1] using the provided `box_lo` and `box_hi`.",
+                "Transform the target spectra for $\\ell \\ge 2$: compute `log(TT)`, `log(EE)`, `log(PP)`, and `atanh(TE / sqrt(TT * EE))`.",
+                "Compute and save the per-feature mean and standard deviation of these log-transformed and atanh-transformed target spectra across the dataset. This standardization is critical for stable convergence given the ~21,000 output dimensions.",
+                "Split the combined dataset into a training set (95,000 samples) and a fixed local validation set (5,000 samples).",
+                "Save the processed training and validation datasets, along with the input and output normalization statistics, to disk in `{database_path}` as `.npz` files."
+            ],
+            "sub_task": "Load, generate, and preprocess the dataset, including target transformations and normalization statistics.",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Create a Python module defining the data transformations and inverse transformations.",
+                "Define a Flax neural network architecture: a deeper and wider MLP (e.g., 512 or 1024 units per layer with 4-6 hidden layers) with ReLU activations. The output layer must have no activation function (linear output) and predict the standardized transformed spectra for $\\ell \\ge 2$ (size: 3*5999 + 2999 = 20996).",
+                "Implement the `Emulator` class with the `predict(params: dict) -> dict` method.",
+                "The `Emulator` class must load and store the precomputed output normalization statistics (mean and std) to apply the correct inverse normalization during inference.",
+                "The `predict` method must: convert the input dict to a normalized parameter array, run the JIT-compiled Flax model forward pass in `float32`, apply the inverse standardization, apply the inverse transformations (`exp` with clipping, `tanh`), cast to `float64`, fill $\\ell=0$ and $\\ell=1$ with zeros, and return the dictionary with keys 'tt', 'te', 'ee', 'pp'.",
+                "Save this code so it can be imported in subsequent steps."
+            ],
+            "sub_task": "Define the model architecture, data transformations, and the Emulator class.",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "MUST include GPU setup at the very top: `os.environ['JAX_PLATFORMS'] = 'cuda'`.",
+                "Load the training and validation data, and normalization statistics from Step 1. Import the model architecture from Step 2.",
+                "Define the Stage 1 loss function: Mean Squared Error (MSE) on the standardized transformed spectra for $\\ell \\ge 2$.",
+                "Set up the Optax Adam optimizer with a warmup phase (e.g., 5-10 epochs with a low learning rate) followed by a cosine annealing learning rate schedule.",
+                "Implement mini-batch training with a batch size of 512-2048, ensuring the training data is shuffled at the start of each epoch.",
+                "Set the total training budget based on wall-clock time (e.g., stop safely before the 7200s timeout) rather than a fixed epoch count.",
+                "Use the MSE on the local validation split as the primary early-stopping criterion.",
+                "Call `cec.get_accuracy_score(emu)` only at the end of training (or at coarse intervals like every 50 epochs) to avoid overhead.",
+                "Save the model weights with the best validation score and the training/validation loss history to `{database_path}`."
+            ],
+            "sub_task": "Train the model using MSE loss on the standardized transformed spectra (Stage 1).",
+            "sub_task_agent": "engineer",
+            "code_execution_timeout": 7200
+        },
+        {
+            "bullet_points": [
+                "MUST include GPU setup at the very top: `os.environ['JAX_PLATFORMS'] = 'cuda'`.",
+                "Load the training data, validation data, and the best model weights from Step 3.",
+                "Define the Stage 2 loss function: an approximate Wishart likelihood. Specifically, compute for each sample the log-determinant of the 2x2 CMB covariance matrix (using the emulated log TT, log EE, and rho outputs) and the trace term, then minimize the MSE between the emulated and true values of these quantities.",
+                "Fine-tune the model using mini-batch training for additional epochs with a lower learning rate.",
+                "Monitor the validation loss for early stopping.",
+                "Save the final fine-tuned model weights and the Stage 2 loss history to `{database_path}`."
+            ],
+            "sub_task": "Fine-tune the model using a Wishart-approximate loss (Stage 2).",
+            "sub_task_agent": "engineer",
+            "code_execution_timeout": 7200
+        },
+        {
+            "bullet_points": [
+                "MUST include CPU setup at the very top: `os.environ['JAX_PLATFORMS'] = 'cpu'` before importing JAX.",
+                "Load the final fine-tuned model weights from Step 4 and instantiate the emulator.",
+                "Run `cec.get_score(emu)` to obtain the combined score, precision (`mae_total`), and CPU timing.",
+                "Print the full results dictionary, explicitly reporting the per-spectrum breakdown of the accuracy score (`mae_cmb` and `mae_pp` separately, in addition to `mae_total`).",
+                "Generate a plot comparing the emulated spectra (TT, TE, EE, PP) against the true spectra for a few random samples from the validation set.",
+                "Generate a plot of the fractional residuals `(Emulated - True) / True` for the same samples.",
+                "Generate plots of the training and validation loss curves (MSE loss vs. epoch for Stage 1, and Wishart-approximate loss vs. epoch for Stage 2).",
+                "Save all plots to `{database_path}`."
+            ],
+            "sub_task": "Evaluate the final model on CPU and generate plots.",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Summarize the methodology, including data preparation, target transformations, model architecture (depth/width), and the two-stage training process.",
+                "Report the quantitative results: final `mae_total`, per-spectrum breakdown (`mae_cmb`, `mae_pp`), CPU inference time, and the combined score `S`.",
+                "Discuss the trade-off between model size (which affects CPU inference time) and precision (`mae_total`). Comment on whether the 1 ms CPU inference floor was reached and how the combined score S compares to the ConstantPlanck baseline of `log10(1.13e7) + 0 = 7.05`.",
+                "Interpret the plots generated in Step 5, discussing the accuracy of the emulator across different multipoles ($\\ell$), spectra, and the convergence behavior shown in the loss curves.",
+                "Conclude on the effectiveness of the approach and its suitability for the competition."
+            ],
+            "sub_task": "Write the final research report.",
+            "sub_task_agent": "researcher"
+        }
+    ]
+}
