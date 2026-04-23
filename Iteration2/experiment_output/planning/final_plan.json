@@ -1,0 +1,73 @@
+{
+    "sub_tasks": [
+        {
+            "bullet_points": [
+                "Set `os.environ['JAX_PLATFORMS'] = 'cuda'` before importing JAX to ensure GPU usage.",
+                "Load the training data using `cec.load_train()`.",
+                "Extract `params`, `tt`, `te`, `ee`, `pp`, `box_lo`, `box_hi`. Normalize `params` to the [0, 1] range.",
+                "Transform the spectra: `log_tt = np.log(tt)`, `log_ee = np.log(ee)`, `log_pp = np.log(pp)`.",
+                "Compute `rho = te / np.sqrt(tt * ee)`, clip to `(-1 + 1e-7, 1 - 1e-7)`, and apply `arctanh(rho)`.",
+                "Concatenate into a target array of size 21004 (`log_tt` (6001) + `log_ee` (6001) + `log_pp` (3001) + `arctanh(rho)` (6001)).",
+                "Split into 45,000 training and 5,000 validation sets.",
+                "Define a high-capacity Teacher MLP (e.g., 6 hidden layers of 1024 units, possibly with residual connections).",
+                "Train using MSE loss with a cosine decay learning rate schedule with warm restarts.",
+                "Create a temporary Emulator class for the Teacher (ensuring float64 casting in `predict`).",
+                "Periodically (e.g., every 20 epochs) evaluate using `cec.get_accuracy_score` and select the best checkpoint based on `mae_total`.",
+                "Generate distillation datasets: pass the 50,000 inputs through the Teacher to get noise-free targets. Generate 10,000 new random parameter sets, normalize, and pass through the Teacher to create a synthetic validation set.",
+                "Save the Teacher model weights, normalization constants, and distillation datasets to disk."
+            ],
+            "sub_task": "Data Preparation, Teacher Model Training, and Distillation Data Generation",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Set `os.environ['JAX_PLATFORMS'] = 'cuda'` before importing JAX.",
+                "Load the distillation training and synthetic validation datasets generated in Step 1.",
+                "Compute the inverse variance of the Teacher's predictions across the training set to use as weights for a sophisticated distillation loss.",
+                "Define a compact Student MLP (e.g., starting with 3 hidden layers of 128 units).",
+                "Train the Student model using the inverse-variance weighted MSE loss against the Teacher's outputs.",
+                "Implement iterative width tuning: after an initial training run, create a temporary emulator, run a JIT warm-up, and call `cec.get_time_score`. If the timing is well below 1 ms, increase the width (e.g., to 256 or 512) and retrain to maximize precision within the speed budget.",
+                "Save the final tuned Student model weights to disk."
+            ],
+            "sub_task": "Student Model Training (Knowledge Distillation) and Iterative Tuning",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Set `os.environ['JAX_PLATFORMS'] = 'cpu'` before importing JAX to ensure CPU timing is accurate.",
+                "Create a standalone Python class with a `predict(params: dict) -> dict` method using a pure, static JAX function (`jax.jit`) with hardcoded/injected weights from the Student model.",
+                "Ensure the forward pass is in `float32`, and the final outputs are cast to `float64` before exponentiation/tanh and returning.",
+                "Instantiate the emulator and perform a JIT warm-up by calling `predict` at least once with dummy data.",
+                "Run `cec.get_accuracy_score(emu)` and `cec.get_time_score(emu)`.",
+                "Run `cec.get_score(emu)` to get the final combined score.",
+                "Compute relative residuals `(emulated - true) / true` for TT, TE, EE, and PP spectra on the validation set.",
+                "Save the metrics to a JSON file and the residuals to a `.npz` file."
+            ],
+            "sub_task": "Functional Inference Implementation and Benchmarking",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Load the residuals `.npz` file saved in Step 3.",
+                "Generate a multi-panel plot showing relative residuals for TT, TE, EE, and PP spectra as a function of multipole `ell`.",
+                "Save the plot to disk at high resolution."
+            ],
+            "sub_task": "Diagnostic Visualization of Residuals",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Summarize the methodology: Teacher-Student knowledge distillation, data transformations, and architecture choices.",
+                "Report the quantitative results: Teacher validation loss, Student validation loss, precision score (`mae_total`), and CPU inference time.",
+                "Quantitatively compare `mae_total` against the `ConstantPlanck` baseline (1.13x10^7).",
+                "Report the decomposition into `mae_cmb` and `mae_pp` contributions.",
+                "Discuss the combined score `S = log10(mae_total) + log10(max(t_cpu_ms, 1.0))` in terms of the precision-speed trade-off.",
+                "Discuss how the functional JAX implementation and float64 casting contributed to meeting the competition constraints.",
+                "Reference and interpret the residual plots generated in Step 4 to diagnose which spectral regions drive the `mae_total` score.",
+                "Conclude on the success of the emulator."
+            ],
+            "sub_task": "Final Report",
+            "sub_task_agent": "researcher"
+        }
+    ]
+}
