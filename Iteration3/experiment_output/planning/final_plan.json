@@ -1,0 +1,98 @@
+{
+    "sub_tasks": [
+        {
+            "bullet_points": [
+                "Load the training data and examine shapes, parameter ranges, and spectral statistics",
+                "Compute log-transformed spectra: log(TT), log(EE), log(PP) for all 50,000 samples; compute correlation coefficient rho = TE/sqrt(TT*EE) for TE",
+                "Compute fixed baselines: mean of log-TT, log-EE, log-PP across training set; mean rho for TE",
+                "Compute residuals (log-spectra minus baseline) and print statistics (mean, std, min, max) per spectrum type to quantify dynamic range reduction",
+                "Save baseline arrays and residual statistics to disk for use in subsequent steps",
+                "Generate diagnostic plots: (a) example spectra for a few cosmologies on log scale, (b) distribution of residuals for each spectrum type, (c) parameter distributions across training set"
+            ],
+            "sub_task": "Data exploration and baseline definition",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Set up JAX with CUDA GPU environment (mandatory preamble: os.environ['JAX_PLATFORMS'] = 'cuda' before import jax)",
+                "Implement a Flax MLP with a single shared trunk (4 layers, 512 hidden units, SiLU/GELU activations) and four separate output heads: TT head (output dim 6001), EE head (output dim 6001), PP head (output dim 3001), rho head (output dim 6001)",
+                "Load baseline arrays from Step 1; implement the full emulator class with predict(params_dict) -> dict that normalizes inputs, runs float32 MLP forward pass, adds baseline, exponentiates to float64, constructs TE from rho*sqrt(TT*EE) in float64",
+                "Implement hybrid loss: weighted MSE on residuals for each head independently, with per-spectrum weights informed by residual std statistics from Step 1; include alpha-weighted teacher-student term that decays linearly from 0.5 to 0.0 over the first 100 epochs",
+                "Set up Optax Adam optimizer with cosine decay LR schedule with warmup (e.g., warmup 10 epochs, peak LR 3e-4, decay to 1e-5)",
+                "Reserve 5,000 samples as validation split; train on remaining 45,000",
+                "Train for 200 epochs, printing train loss and validation loss every 10 epochs",
+                "Save model weights and training history to disk"
+            ],
+            "sub_task": "Architecture design and JAX/Flax model implementation with initial training",
+            "sub_task_agent": "engineer",
+            "code_execution_timeout": 3600
+        },
+        {
+            "bullet_points": [
+                "Load trained model weights from Step 2 and instantiate the emulator",
+                "Evaluate using cec.get_accuracy_score(emu) and print mae_total, mae_cmb, mae_pp in detail",
+                "Perform per-spectrum error decomposition: compute per-ell absolute errors for TT, TE, EE, PP on the validation split; identify which multipole range (low-ell: 2-500, mid-ell: 500-2500, high-ell: 2500-6000 for CMB; low-ell: 2-500, high-ell: 500-3000 for PP) dominates the error",
+                "Print which spectrum and which ell range contributes most to mae_total to guide architecture decisions",
+                "Based on error decomposition: if precision is insufficient, increase width to 1024 or add a 5th layer; if a specific ell range dominates, consider adding a dedicated residual correction for that range",
+                "Continue training the refined architecture for 300-500 additional epochs with lower peak LR (e.g., 5e-5)",
+                "Re-evaluate accuracy after continued training and print updated mae_total, mae_cmb, mae_pp",
+                "Save updated model weights and accuracy metrics to disk"
+            ],
+            "sub_task": "Accuracy evaluation, per-spectrum error decomposition, and architecture refinement",
+            "sub_task_agent": "engineer",
+            "code_execution_timeout": 7200
+        },
+        {
+            "bullet_points": [
+                "Load the best model checkpoint from Step 3",
+                "Implement a training loop that calls cec.get_accuracy_score every 20 epochs to monitor mae_total directly; save the best checkpoint based on mae_total",
+                "Use cosine annealing with warm restarts (e.g., restart every 100 epochs) to escape local minima",
+                "Train for up to 500 additional epochs, printing mae_total at each evaluation checkpoint",
+                "Only if mae_total plateaus above 10^5 after the full training budget, generate additional training data using cec.generate_data (e.g., 50,000 extra samples) and continue training; otherwise skip data generation to preserve compute budget",
+                "Save the best model weights and final accuracy metrics to disk"
+            ],
+            "sub_task": "Extended training with MAE-guided optimization and conditional data augmentation",
+            "sub_task_agent": "engineer",
+            "code_execution_timeout": 7200
+        },
+        {
+            "bullet_points": [
+                "Load the best model from Step 4 and generate predictions on a sample of test/validation cosmologies",
+                "Generate a multi-panel figure: (a) training loss curve over epochs, (b) mae_total progression during training (log scale), (c) example predicted vs true spectra for TT, TE, EE, PP for 3-5 test cosmologies",
+                "Generate a per-ell relative error plot with log-scale y-axis, separately showing ell=2 to 2500 for TT/TE/EE and ell=2 to 1000 for PP (the Wishart-sensitive ranges); plot median and 90th percentile relative error across the validation set",
+                "Generate a residual distribution plot (predicted minus true log-spectra) for each spectrum type",
+                "Save all plots to disk with descriptive filenames and timestamps"
+            ],
+            "sub_task": "Diagnostic visualization of model predictions and per-ell errors",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Set JAX to CPU mode (os.environ['JAX_PLATFORMS'] = 'cpu' before import jax — mandatory for timing)",
+                "Load the best model weights from Step 4",
+                "Implement a fully JIT-compiled predict function; ensure all operations (normalization, MLP forward pass, baseline addition, exponentiation, float64 cast) are inside the JIT-compiled graph",
+                "Warm up the JIT-compiled function by calling predict at least once before timing; print both pre-warmup and post-warmup latency to confirm JIT compilation is working",
+                "Run cec.get_time_score(emu) to measure CPU inference latency; if latency exceeds 1.0 ms, profile and consider reducing model width",
+                "Run cec.get_score(emu) to get the combined score S; print all timing and accuracy results in full detail",
+                "Save the final emulator as a self-contained Python module (class definition + saved weights loading) so it can be instantiated without re-running the training pipeline",
+                "Save all score results to disk"
+            ],
+            "sub_task": "CPU inference optimization, speed benchmarking, and final scoring",
+            "sub_task_agent": "engineer"
+        },
+        {
+            "bullet_points": [
+                "Summarize the architecture design: shared trunk MLP depth/width, separate output heads per spectrum, activation functions, residual decomposition approach, and float64 casting strategy",
+                "Report the baseline statistics and dynamic range reduction achieved by log-transformation and residual decomposition (from Step 1)",
+                "Report the training progression: loss curves, mae_total evolution over epochs, convergence behavior, and effect of cosine annealing restarts",
+                "Report the per-spectrum error decomposition results: which spectrum (TT, TE, EE, PP) and which ell range dominates the error, and how architecture refinements addressed these bottlenecks",
+                "Report the final accuracy metrics: mae_total, mae_cmb, mae_pp; explicitly compare to the ConstantPlanck baseline (1.13×10^7) and the competition target (10^4), computing the improvement factor in orders of magnitude",
+                "Report the CPU inference timing: pre-warmup vs post-warmup latency, whether the 1.0 ms floor was achieved, and the marginal benefit of further speed optimization given the combined score formula",
+                "Report the final combined score S = log10(mae_total) + log10(max(t_cpu_ms, 1.0)) and discuss the precision-speed trade-off",
+                "Reference all generated plots with quantitative interpretation of key results"
+            ],
+            "sub_task": "Write the full Results section",
+            "sub_task_agent": "researcher"
+        }
+    ]
+}
